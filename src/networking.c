@@ -108,10 +108,13 @@ client *createClient(int fd) {
     c->slave_ip[0] = '\0';
     c->slave_capa = SLAVE_CAPA_NONE;
     c->reply = listCreate();
+    c->request = listCreate();
     c->reply_bytes = 0;
     c->obuf_soft_limit_reached_time = 0;
     listSetFreeMethod(c->reply,decrRefCountVoid);
     listSetDupMethod(c->reply,dupClientReplyValue);
+    listSetFreeMethod(c->request,decrProxyAsyncCommandRefCountCleanClient);
+    listSetDupMethod(c->request,dupProxyAsyncCommand);
     c->btype = BLOCKED_NONE;
     c->bpop.timeout = 0;
     c->bpop.keys = dictCreate(&setDictType,NULL);
@@ -829,6 +832,7 @@ void freeClient(client *c) {
 
     /* Free data structures. */
     listRelease(c->reply);
+    listRelease(c->request);
     freeClientArgv(c);
 
     /* Unlink the client: this will close the socket, remove the I/O

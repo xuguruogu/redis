@@ -9,6 +9,7 @@ redis-check-dump
 redis-cli
 redis-sentinel
 redis-server
+redis-proxy
 doc-tools
 release
 misc/*
@@ -27,3 +28,4 @@ deps/lua/src/liblua.a
 .make-*
 .prerequisites
 *.dSYM
+xcode/

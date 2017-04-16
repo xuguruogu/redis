@@ -613,6 +613,9 @@ typedef struct client {
     /* Response buffer */
     int bufpos;
     char buf[PROTO_REPLY_CHUNK_BYTES];
+    
+    /* proxy mode */
+    list *request;      /* List of request redisCommand from the client. */
 } client;
 
 struct saveparam {
@@ -721,6 +724,7 @@ struct redisServer {
     int cronloops;              /* Number of times the cron function run */
     char runid[CONFIG_RUN_ID_SIZE+1];  /* ID always different at every exec. */
     int sentinel_mode;          /* True if this instance is a Sentinel. */
+    int proxy_mode;          /* True if this instance is a Proxy. */
     /* Networking */
     int port;                   /* TCP listening port */
     int tcp_backlog;            /* TCP listen() backlog */
@@ -1451,6 +1455,19 @@ void initSentinel(void);
 void sentinelTimer(void);
 char *sentinelHandleConfiguration(char **argv, int argc);
 void sentinelIsRunning(void);
+
+/* Proxy */
+void initProxyConfig(void);
+void initProxy(void);
+void proxyTimer(void);
+char *proxyHandleConfiguration(char **argv, int argc);
+void proxyIsRunning(void);
+void decrProxyAsyncCommandRefCount(void *ptr);
+void *dupProxyAsyncCommand(void *o);
+void decrProxyAsyncCommandRefCountCleanClient(void *ptr);
+void decrProxyAsyncCommandRefCount(void *ptr);
+void incrProxyAsyncCommandRefCount(void *ptr);
+void proxyBeforeSleep(void);
 
 /* redis-check-rdb */
 int redis_check_rdb(char *rdbfilename);

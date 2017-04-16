@@ -619,6 +619,17 @@ void loadServerConfigFromString(char *config) {
                 err = sentinelHandleConfiguration(argv+1,argc-1);
                 if (err) goto loaderr;
             }
+        } else if (!strcasecmp(argv[0],"proxy")) {
+            /* argc == 1 is handled by main() as we need to enter the proxy
+             * mode ASAP. */
+            if (argc != 1) {
+                if (!server.proxy_mode) {
+                    err = "proxy directive while not in proxy mode";
+                    goto loaderr;
+                }
+                err = proxyHandleConfiguration(argv+1,argc-1);
+                if (err) goto loaderr;
+            }
         } else {
             err = "Bad directive or wrong number of arguments"; goto loaderr;
         }
@@ -1262,6 +1273,10 @@ void dictListDestructor(void *privdata, void *val);
 /* Sentinel config rewriting is implemented inside sentinel.c by
  * rewriteConfigSentinelOption(). */
 void rewriteConfigSentinelOption(struct rewriteConfigState *state);
+    
+/* Proxy config rewriting is implemented inside proxy.c by
+ * rewriteConfigProxyOption(). */
+void rewriteConfigProxyOption(struct rewriteConfigState *state);
 
 dictType optionToLineDictType = {
     dictSdsCaseHash,            /* hash function */
@@ -1855,6 +1870,9 @@ int rewriteConfig(char *path) {
 
     /* Rewrite Sentinel config if in Sentinel mode. */
     if (server.sentinel_mode) rewriteConfigSentinelOption(state);
+    
+    /* Rewrite Proxy config if in Sentinel mode. */
+    if (server.proxy_mode) rewriteConfigProxyOption(state);
 
     /* Step 3: remove all the orphaned lines in the old file, that is, lines
      * that were used by a config option and are no longer used, like in case

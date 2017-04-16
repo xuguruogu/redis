@@ -332,6 +332,8 @@ void serverLogRaw(int level, const char *msg) {
         snprintf(buf+off,sizeof(buf)-off,"%03d",(int)tv.tv_usec/1000);
         if (server.sentinel_mode) {
             role_char = 'X'; /* Sentinel. */
+        } else if (server.proxy_mode) {
+            role_char = 'P'; /* Proxy. */
         } else if (pid != server.pid) {
             role_char = 'C'; /* RDB / AOF writing child. */
         } else {
@@ -1155,12 +1157,21 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 
     /* Show information about connected clients */
     if (!server.sentinel_mode) {
-        run_with_period(5000) {
-            serverLog(LL_VERBOSE,
-                "%lu clients connected (%lu slaves), %zu bytes in use",
-                listLength(server.clients)-listLength(server.slaves),
-                listLength(server.slaves),
-                zmalloc_used_memory());
+        if (server.proxy_mode) {
+            run_with_period(5000) {
+                serverLog(LL_VERBOSE,
+                          "%lu clients connected (%lu slaves), %zu bytes in use",
+                          listLength(server.clients)-listLength(server.slaves),
+                          listLength(server.slaves),
+                          zmalloc_used_memory());
+            }
+        } else {
+            run_with_period(5000) {
+                serverLog(LL_VERBOSE,
+                          "%lu clients connected, %zu bytes in use",
+                          listLength(server.clients),
+                          zmalloc_used_memory());
+            }
         }
     }
 
@@ -1282,6 +1293,11 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     run_with_period(100) {
         if (server.sentinel_mode) sentinelTimer();
     }
+    
+    /* Run the Proxy timer if we are in proxy mode. */
+    run_with_period(100) {
+        if (server.proxy_mode) proxyTimer();
+    }
 
     /* Cleanup expired MIGRATE cached sockets. */
     run_with_period(1000) {
@@ -1319,6 +1335,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * so it's a good idea to call it before serving the unblocked clients
      * later in this function. */
     if (server.cluster_enabled) clusterBeforeSleep();
+    
+    if (server.proxy_mode) proxyBeforeSleep();
 
     /* Run a fast expire cycle (the called function will return
      * ASAP if a fast cycle is not needed). */
@@ -1998,7 +2016,8 @@ void initServer(void) {
     scriptingInit(1);
     slowlogInit();
     latencyMonitorInit();
-    bioInit();
+    if (!server.proxy_mode)
+        bioInit();
 }
 
 /* Populates the Redis Command Table starting from the hard coded list
@@ -2618,7 +2637,7 @@ int prepareForShutdown(int flags) {
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
     serverLog(LL_WARNING,"%s is now ready to exit, bye bye...",
-        server.sentinel_mode ? "Sentinel" : "Redis");
+              server.sentinel_mode ? "Sentinel" : server.proxy_mode ? "proxy" : "Redis");
     return C_OK;
 }
 
@@ -2866,6 +2885,7 @@ sds genRedisInfoString(char *section) {
 
         if (server.cluster_enabled) mode = "cluster";
         else if (server.sentinel_mode) mode = "sentinel";
+        else if (server.proxy_mode) mode = "proxy";
         else mode = "standalone";
 
         if (sections++) info = sdscat(info,"\r\n");
@@ -3703,6 +3723,8 @@ void usage(void) {
     fprintf(stderr,"       ./redis-server /etc/myredis.conf --loglevel verbose\n\n");
     fprintf(stderr,"Sentinel mode:\n");
     fprintf(stderr,"       ./redis-server /etc/sentinel.conf --sentinel\n");
+    fprintf(stderr,"Proxy mode:\n");
+    fprintf(stderr,"       ./redis-server /etc/proxy.conf --proxy\n");
     exit(1);
 }
 
@@ -3713,6 +3735,7 @@ void redisAsciiArt(void) {
 
     if (server.cluster_enabled) mode = "cluster";
     else if (server.sentinel_mode) mode = "sentinel";
+    else if (server.proxy_mode) mode = "proxy";
     else mode = "standalone";
 
     if (server.syslog_enabled) {
@@ -3805,6 +3828,17 @@ int checkForSentinelMode(int argc, char **argv) {
     return 0;
 }
 
+/* Returns 1 if there is --proxy among the arguments or if
+ * argv[0] is exactly "redis-proxy". */
+int checkForProxyMode(int argc, char **argv) {
+    int j;
+    
+    if (strstr(argv[0],"redis-proxy") != NULL) return 1;
+    for (j = 1; j < argc; j++)
+        if (!strcmp(argv[j],"--proxy")) return 1;
+    return 0;
+}
+
 /* Function called at startup to load RDB or AOF file in memory. */
 void loadDataFromDisk(void) {
     long long start = ustime();
@@ -3833,6 +3867,7 @@ void redisSetProcTitle(char *title) {
     char *server_mode = "";
     if (server.cluster_enabled) server_mode = " [cluster]";
     else if (server.sentinel_mode) server_mode = " [sentinel]";
+    else if (server.proxy_mode) server_mode = " [proxy]";
 
     setproctitle("%s %s:%d%s",
         title,
@@ -3981,6 +4016,12 @@ int main(int argc, char **argv) {
     gettimeofday(&tv,NULL);
     dictSetHashFunctionSeed(tv.tv_sec^tv.tv_usec^getpid());
     server.sentinel_mode = checkForSentinelMode(argc,argv);
+    server.proxy_mode = checkForProxyMode(argc,argv);
+    if ( server.sentinel_mode && server.proxy_mode) {
+        serverLog(LL_WARNING,
+                  "proxy mode and sentinel mode should not be set at the same time.  Exiting...");
+        exit(1);
+    }
     initServerConfig();
 
     /* Store the executable path and arguments in a safe place in order
@@ -3996,6 +4037,10 @@ int main(int argc, char **argv) {
     if (server.sentinel_mode) {
         initSentinelConfig();
         initSentinel();
+    }
+    if (server.proxy_mode) {
+        initProxyConfig();
+        initProxy();
     }
 
     /* Check if we need to start in redis-check-rdb mode. We just execute
@@ -4065,11 +4110,18 @@ int main(int argc, char **argv) {
                 "Sentinel needs config file on disk to save state.  Exiting...");
             exit(1);
         }
+        if (server.proxy_mode && configfile && *configfile == '-') {
+            serverLog(LL_WARNING,
+                      "Proxy config from STDIN not allowed.");
+            serverLog(LL_WARNING,
+                      "Proxy needs config file on disk to save state.  Exiting...");
+            exit(1);
+        }
         resetServerSaveParams();
         loadServerConfig(configfile,options);
         sdsfree(options);
     } else {
-        serverLog(LL_WARNING, "Warning: no config file specified, using the default config. In order to specify a config file use %s /path/to/%s.conf", argv[0], server.sentinel_mode ? "sentinel" : "redis");
+        serverLog(LL_WARNING, "Warning: no config file specified, using the default config. In order to specify a config file use %s /path/to/%s.conf", argv[0], server.sentinel_mode ? "sentinel" : server.proxy_mode ? "proxy" : "redis");
     }
 
     server.supervised = redisIsSupervised(server.supervised_mode);
@@ -4082,18 +4134,23 @@ int main(int argc, char **argv) {
     redisAsciiArt();
     checkTcpBacklogSettings();
 
-    if (!server.sentinel_mode) {
-        /* Things not needed when running in Sentinel mode. */
+    
+    if (server.sentinel_mode) {
+        sentinelIsRunning();
+    } else if (server.proxy_mode){
+        proxyIsRunning();
+    } else{
+        /* Things not needed when running in Sentinel or Proxy mode. */
         serverLog(LL_WARNING,"Server started, Redis version " REDIS_VERSION);
-    #ifdef __linux__
+#ifdef __linux__
         linuxMemoryWarnings();
-    #endif
+#endif
         loadDataFromDisk();
         if (server.cluster_enabled) {
             if (verifyClusterConfigWithData() == C_ERR) {
                 serverLog(LL_WARNING,
-                    "You can't have keys in a DB different than DB 0 when in "
-                    "Cluster mode. Exiting.");
+                          "You can't have keys in a DB different than DB 0 when in "
+                          "Cluster mode. Exiting.");
                 exit(1);
             }
         }
@@ -4101,8 +4158,6 @@ int main(int argc, char **argv) {
             serverLog(LL_NOTICE,"The server is now ready to accept connections on port %d", server.port);
         if (server.sofd > 0)
             serverLog(LL_NOTICE,"The server is now ready to accept connections at %s", server.unixsocket);
-    } else {
-        sentinelIsRunning();
     }
 
     /* Warning the user about suspicious maxmemory setting. */

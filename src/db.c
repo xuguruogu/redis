@@ -722,7 +722,7 @@ void shutdownCommand(client *c) {
      * with half-read data).
      *
      * Also when in Sentinel mode clear the SAVE flag and force NOSAVE. */
-    if (server.loading || server.sentinel_mode)
+    if (server.loading || server.sentinel_mode || server.proxy_mode)
         flags = (flags & ~SHUTDOWN_SAVE) | SHUTDOWN_NOSAVE;
     if (prepareForShutdown(flags) == C_OK) exit(0);
     addReplyError(c,"Errors trying to SHUTDOWN. Check logs.");
