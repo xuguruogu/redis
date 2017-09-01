@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.8 FATAL_ERROR)
+
+project( REDIS C )
+
+find_file(LIB_LUA liblua.a  ${REDIS_SOURCE_DIR}/deps/lua/src)
+find_file(LIB_HIREDIS libhiredis.a  ${REDIS_SOURCE_DIR}/deps/hiredis)
+find_file(LIB_LINENOISE linenoise.o  ${REDIS_SOURCE_DIR}/deps/linenoise)
+
+set(REDIS_LIBS
+    ${LIB_LUA}
+    ${LIB_HIREDIS}
+    ${LIB_LINENOISE})
+
+message(${REDIS_LIBS})
+
+# add_subdirectory(deps)
+add_subdirectory(src)
