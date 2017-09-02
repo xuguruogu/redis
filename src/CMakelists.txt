@@ -1,4 +1,5 @@
 set(EXE_SERVER "redis-server")
+set(EXE_CLI "redis-cli")
 
 execute_process(COMMAND sh -x ${CMAKE_CURRENT_SOURCE_DIR}/mkreleasehdr.sh
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
@@ -126,21 +127,44 @@ add_executable(
     ${REDIS_FILES}
 )
 
-source_group("redis release files" FILES ${REDIS_RELEASE_HFILE})
-source_group("redis source files" FILES ${REDIS_CFILES})
-source_group("redis header files" FILES ${REDIS_HFILES})
-
-include_directories(
+target_include_directories(
+    ${EXE_SERVER} PUBLIC
     ${REDIS_SOURCE_DIR}/deps/hiredis
     ${REDIS_SOURCE_DIR}/deps/lua/src
     ${REDIS_SOURCE_DIR}/deps/geohash-int
     ${REDIS_SOURCE_DIR}/deps/linenoise)
-
-message(${REDIS_SOURCE_DIR}/deps/hiredis)
-
 target_link_libraries( ${EXE_SERVER} liblua libhiredis liblinenoise)
 
 set_target_properties(${EXE_SERVER} PROPERTIES
     DEBUG_POSTFIX "${CMAKE_DEBUG_POSTFIX}")
 
+set(REDIS_CLI_HFILES
+    anet.h
+    adlist.h
+    zmalloc.h
+    ae.h
+    crc64.h)
+
+set(REDIS_CLI_CFILES
+    anet.c
+    adlist.c
+    redis-cli.c
+    zmalloc.c
+    ae.c
+    crc64.c
+    release.c)
+
+add_executable(${EXE_CLI}
+    ${REDIS_CLI_HFILES} ${REDIS_CLI_CFILES} ${REDIS_RELEASE_HFILE})
+
+target_include_directories(
+    ${EXE_CLI} BEFORE PUBLIC
+    ${REDIS_SOURCE_DIR}/deps/hiredis
+    ${REDIS_SOURCE_DIR}/deps/linenoise)
+target_link_libraries( ${EXE_CLI} libhiredis liblinenoise)
+
+set_target_properties(${EXE_CLI} PROPERTIES
+    DEBUG_POSTFIX "${CMAKE_DEBUG_POSTFIX}")
+
 install(TARGETS ${EXE_SERVER} DESTINATION bin)
+install(TARGETS ${EXE_CLI} DESTINATION bin)
