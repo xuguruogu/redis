@@ -133,7 +133,7 @@ target_include_directories(
     ${REDIS_SOURCE_DIR}/deps/lua/src
     ${REDIS_SOURCE_DIR}/deps/geohash-int
     ${REDIS_SOURCE_DIR}/deps/linenoise)
-target_link_libraries( ${EXE_SERVER} liblua libhiredis liblinenoise)
+target_link_libraries( ${EXE_SERVER} m dl pthread liblua libhiredis liblinenoise)
 
 set_target_properties(${EXE_SERVER} PROPERTIES
     DEBUG_POSTFIX "${CMAKE_DEBUG_POSTFIX}")
