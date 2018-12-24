@@ -32,6 +32,7 @@
 #include <sys/uio.h>
 #include <math.h>
 #include <ctype.h>
+#include "slowlog.h"
 
 static void setProtocolError(const char *errstr, client *c, int pos);
 
@@ -125,6 +126,18 @@ client *createClient(int fd) {
     c->btype = BLOCKED_NONE;
     c->bpop.timeout = 0;
     c->bpop.keys = dictCreate(&objectKeyPointerValueDictType,NULL);
+    if (server.swap_mode) {
+        c->context = NULL;
+        c->repl_timer_id = -1;
+        c->ssdb_status = SSDB_NONE;
+        c->transfer_snapshot_last_keepalive_time = -1;
+        c->bpop.loading_or_transfer_keys = dictCreate(&objectKeyPointerValueDictType,NULL);
+        c->ssdb_conn_flags = 0;
+        c->ssdb_replies[0] = NULL;
+        c->ssdb_replies[1] = NULL;
+        c->revert_len = 0;
+        c->first_key_index = 0;
+    }
     c->bpop.target = NULL;
     c->bpop.numreplicas = 0;
     c->bpop.reploffset = 0;
@@ -177,14 +190,17 @@ int prepareClientToWrite(client *c) {
 
     if (c->fd <= 0) return C_ERR; /* Fake client for AOF loading. */
 
+    if (server.swap_mode && c == server.slave_ssdb_load_evict_client) return C_ERR;
+
     /* Schedule the client to write the output buffers to the socket only
      * if not already done (there were no pending writes already and the client
      * was yet not flagged), and, for slaves, if the slave can actually
      * receive writes at this stage. */
     if (!clientHasPendingReplies(c) &&
         !(c->flags & CLIENT_PENDING_WRITE) &&
-        (c->replstate == REPL_STATE_NONE ||
-         (c->replstate == SLAVE_STATE_ONLINE && !c->repl_put_online_on_ack)))
+            (c->replstate == REPL_STATE_NONE ||
+             (c->replstate == SLAVE_STATE_ONLINE && !c->repl_put_online_on_ack) ||
+             (c->flags & CLIENT_SLAVE_FORCE_PROPAGATE)))
     {
         /* Here instead of installing the write handler, we just flag the
          * client and put it into a list of clients that have something
@@ -601,6 +617,392 @@ int clientHasPendingReplies(client *c) {
     return c->bufpos || listLength(c->reply);
 }
 
+void handleConnectSSDBok(client* c) {
+    serverLog(LL_DEBUG, "connect ssdb success");
+    if (server.ssdb_is_down) {
+        serverLog(LL_NOTICE, "[!!!]SSDB is up now");
+        server.ssdb_is_down = 0;
+    }
+    c->revert_len = 0;
+
+    if (c == server.master && server.master->ssdb_conn_flags & CONN_RECEIVE_INCREMENT_UPDATES) {
+        /* do nothing */
+    } else if (c->flags & CLIENT_MASTER && listLength(server.ssdb_write_oplist) > 0) {
+        /* NOTE: to ensure data consistency between the slave myself and our master,
+        * for server.master/server.cached_master connection, if there are unconfirmed
+        * write operations in server.ssdb_write_oplist, which had been send to SSDB
+        * successfully but we don't know whether they are executed actually, we must
+        * confirm with SSDB and re-send all failed writes to SSDB at first, then we change
+        * server.master/server.cached_master->ssdb_conn_flags to CONN_SUCCESS, after that,
+        * SSDB write commands can be send and processed normally by 'processCommandMaybeInSSDB'. */
+
+        serverLog(LL_DEBUG, "master/cached_master connect ssdb success, check repopid...");
+        if (sendRepopidCheckToSSDB(c) == C_OK)
+            c->ssdb_conn_flags |= CONN_CHECK_REPOPID;
+    } else {
+        c->ssdb_conn_flags |= CONN_SUCCESS;
+    }
+}
+
+void ssdbConnectCallback(aeEventLoop *el, int fd, void *privdata, int mask) {
+    int sockerr = 0;
+    socklen_t errlen = sizeof(sockerr);
+    UNUSED(el);
+    UNUSED(mask);
+    client* c = privdata;
+
+    c->ssdb_conn_flags &= ~CONN_CONNECTING;
+    /* Check for errors in the socket: after a non blocking connect() we
+     * may find that the socket is in error state. */
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockerr, &errlen) == -1)
+        sockerr = errno;
+    if (sockerr) {
+        serverLog(LL_WARNING,"Error condition on socket for connect ssdb: %s",
+            strerror(sockerr));
+        goto error;
+    }
+
+    /* Remove the events added before. */
+    aeDeleteFileEvent(server.el, c->context->fd, AE_READABLE|AE_WRITABLE);
+
+    if (aeCreateFileEvent(server.el, c->context->fd,
+                          AE_READABLE, ssdbClientUnixHandler, c) == AE_ERR) {
+        serverLog(LL_VERBOSE, "Unrecoverable error creating ssdbFd file event.");
+        goto error;
+    }
+    handleConnectSSDBok(c);
+    return;
+error:
+    c->ssdb_conn_flags |= CONN_CONNECT_FAILED;
+    aeDeleteFileEvent(server.el,fd,AE_READABLE|AE_WRITABLE);
+    redisFree(c->context);
+    c->context = NULL;
+}
+
+/* Connecting to SSDB unix socket. */
+int nonBlockConnectToSsdbServer(client *c) {
+    redisContext *context = NULL;
+    if (c->context) return C_OK;
+
+    if (server.ssdb_server_unixsocket != NULL) {
+        /* reset connect failed flag before re-connect. */
+        c->ssdb_conn_flags &= ~CONN_CONNECT_FAILED;
+
+        context = redisConnectUnixNonBlock(server.ssdb_server_unixsocket);
+
+        if (!context) {
+            c->ssdb_conn_flags |= CONN_CONNECT_FAILED;
+            return C_ERR;
+        }
+
+        if (context->err) {
+            c->ssdb_conn_flags |= CONN_CONNECT_FAILED;
+            serverLog(LL_VERBOSE, "Could not connect to SSDB server:%s", context->errstr);
+            redisFree(context);
+            return C_ERR;
+        }
+
+        if (errno == EINPROGRESS) {
+            if (aeCreateFileEvent(server.el,context->fd,AE_READABLE|AE_WRITABLE,
+                                  ssdbConnectCallback,c) == AE_ERR)
+            {
+                c->ssdb_conn_flags |= CONN_CONNECT_FAILED;
+                redisFree(context);
+                return C_ERR;
+            }
+            c->ssdb_conn_flags |= CONN_CONNECTING;
+            c->context = context;
+        } else {
+            /* connect success */
+            if (aeCreateFileEvent(server.el, context->fd,
+                                  AE_READABLE, ssdbClientUnixHandler, c) == AE_ERR) {
+                c->ssdb_conn_flags |= CONN_CONNECT_FAILED;
+                redisFree(context);
+                return C_ERR;
+            }
+            c->context = context;
+            handleConnectSSDBok(c);
+        }
+        return C_OK;
+    }
+    return C_ERR;
+}
+
+/* Caller should free finalcmd. */
+sds composeRedisCmd(int argc, const char **argv, const size_t *argvlen) {
+    char *cmd = NULL;
+    sds finalcmd = NULL;
+    int len = 0;
+
+    len = redisFormatCommandArgv(&cmd, argc, argv, argvlen);
+
+    if (len == -1) {
+        serverLog(LL_WARNING, "Out of Memory for redisFormatCommandArgv.");
+        return NULL;
+    }
+
+    finalcmd = sdsnewlen(cmd, len);
+    zlibc_free(cmd);
+
+    return finalcmd;
+}
+
+/* Caller should free finalcmd. */
+sds composeCmdFromArgs(int argc, robj** obj_argv) {
+    int i;
+    sds finalcmd;
+    char ** argv;
+    size_t * argvlen;
+    if (argc > SSDB_CMD_DEFAULT_MAX_ARGC) {
+        argv = zmalloc(sizeof(char *) * argc);
+        argvlen = zmalloc(sizeof(size_t) * argc);
+    } else {
+        argv = server.ssdbargv;
+        argvlen = server.ssdbargvlen;
+    }
+
+    for (i = 0; i < argc; i ++) {
+        argv[i] = obj_argv[i]->ptr;
+        argvlen[i] = sdslen((sds)(obj_argv[i]->ptr));
+    }
+
+    finalcmd = composeRedisCmd(argc, (const char **)argv, (const size_t *)argvlen);
+
+    if (argc > SSDB_CMD_DEFAULT_MAX_ARGC) {
+        zfree(argv);
+        zfree(argvlen);
+    }
+    return finalcmd;
+}
+
+void handleSSDBconnectionDisconnect(client* c) {
+    if ((c->ssdb_conn_flags & CONN_WAIT_FLUSH_CHECK_REPLY) && server.flush_check_begin_time != -1) {
+        server.flush_check_unresponse_num -= 1;
+        c->ssdb_conn_flags &= ~CONN_WAIT_FLUSH_CHECK_REPLY;
+
+        serverLog(LL_DEBUG, "[flushall]connection(c->context->fd:%d, c->fd:%d) with ssdb disconnected, unresponse num:%d",
+                  c->context ? c->context->fd : -1, c->fd, server.flush_check_unresponse_num);
+        if (0 == server.flush_check_unresponse_num) {
+            if (c != server.current_flushall_client)
+                doSSDBflushIfCheckDone();
+            else
+                server.flush_check_begin_time = 0;
+        }
+    } else if (c->ssdb_conn_flags & CONN_WAIT_WRITE_CHECK_REPLY && server.check_write_begin_time != -1) {
+        server.check_write_unresponse_num -= 1;
+        c->ssdb_conn_flags &= ~CONN_WAIT_WRITE_CHECK_REPLY;
+        if (0 == server.check_write_unresponse_num) {
+            if (c != server.ssdb_replication_client)
+                makeSSDBsnapshotIfCheckOK();
+            else
+                resetCustomizedReplication();
+        }
+    }
+
+    c->ssdb_conn_flags &= ~CONN_SUCCESS;
+    c->ssdb_conn_flags |= CONN_CONNECT_FAILED;
+
+    if (c->context) {
+         /* Unlink resources used in connecting to SSDB. */
+        if (c->context->fd > 0)
+            aeDeleteFileEvent(server.el, c->context->fd, AE_READABLE|AE_WRITABLE);
+        redisFree(c->context);
+        c->context = NULL;
+    }
+
+    /* for server.master/server.cached_master only */
+    if (c->flags & CLIENT_MASTER) {
+        c->ssdb_conn_flags &= ~CONN_CHECK_REPOPID;
+        server.send_failed_write_after_unblock = 0;
+        /* if the replication connection(server.master) disconnect, we must clean visiting_ssdb_keys to
+        * avoid wrong visiting count. */
+        dictEmpty(EVICTED_DATA_DB->visiting_ssdb_keys, NULL);
+    }
+}
+
+int closeAndReconnectSSDBconnection(client* c) {
+    if (c->context) {
+        serverLog(LL_DEBUG, "ssdb connection disconnect! c->fd:%d,c->context->fd:%d",
+                  c->fd, c->context ? c->context->fd : -1);
+    }
+    handleSSDBconnectionDisconnect(c);
+
+    if (nonBlockConnectToSsdbServer(c) == C_ERR) {
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+/* don't call this function directly, use sendCommandToSSDB instead. */
+static int internalSendCommandToSSDB(client *c, sds finalcmd) {
+    int nwritten;
+    serverAssert(c && finalcmd);
+    if (!c->context)
+        return C_FD_ERR;
+
+    while (finalcmd && sdslen(finalcmd) > 0) {
+        nwritten = write(c->context->fd, finalcmd, sdslen(finalcmd));
+        if (nwritten == -1) {
+            if (errno == EAGAIN || errno == EINTR) {
+                /* Try again later. */
+            } else {
+                if (isSpecialConnection(c))
+                    freeClient(c);
+                else {
+                    serverLog(LL_WARNING, "Error writing to SSDB server: %s", strerror(errno));
+                    closeAndReconnectSSDBconnection(c);
+                }
+                sdsfree(finalcmd);
+                return C_FD_ERR;
+            }
+        } else if (nwritten > 0) {
+            if (nwritten == (signed) sdslen(finalcmd)) {
+                sdsfree(finalcmd);
+                finalcmd = NULL;
+            } else {
+                sdsrange(finalcmd, nwritten, -1);
+            }
+        }
+    }
+
+    return C_OK;
+}
+
+int sendFailedRetryCommandToSSDB(client* c, sds finalcmd) {
+    serverAssert(finalcmd != NULL);
+    return internalSendCommandToSSDB(c, finalcmd);
+}
+
+int sendRepopidCheckToSSDB(client* c) {
+    if (!(c->flags & CLIENT_MASTER)) return C_ERR;
+
+    const char* tmpargv[2];
+    tmpargv[0] = "repopid";
+    tmpargv[1] = "get";
+
+    sds cmd = composeRedisCmd(2, tmpargv, NULL);
+
+    return internalSendCommandToSSDB(c, cmd);
+}
+
+/* for server.master, we must send all failed writes to SSDB at first, and then
+ * we can set server.master->ssdb_conn_flags to CONN_SUCCESS, if is_slave_retry
+ * is true, we don't check CONN_SUCCESS flag. */
+int sendRepopidToSSDB(client* c, time_t op_time, int op_id, int is_slave_retry) {
+    const char* tmpargv[4];
+    char time[64];
+    char index[32];
+    int ret;
+
+    tmpargv[0] = "repopid";
+    tmpargv[1] = "set";
+    ll2string(time, sizeof(time), op_time);
+    tmpargv[2] = time;
+    ll2string(index, sizeof(index), op_id);
+    tmpargv[3] = index;
+
+    sds cmd = composeRedisCmd(4, tmpargv, NULL);
+
+    if (is_slave_retry)
+        ret = sendFailedRetryCommandToSSDB(c, cmd);
+    else
+        ret = sendCommandToSSDB(c, cmd);
+    return ret;
+}
+
+/* Querying SSDB server if querying redis fails, Compose the finalcmd if finalcmd is NULL. */
+int sendCommandToSSDB(client *c, sds finalcmd) {
+    struct redisCommand *cmd = NULL;
+
+    if (!c) {
+        sdsfree(finalcmd);
+        return C_ERR;
+    }
+
+    /* only if ssdb connection status is CONN_SUCCESS, it's safe to send commands to SSDB.
+     * for example, on server.master connection, we may need to re-send some failed writes
+     * to SSDB after re-connect success, before that, we can't send command to SSDB directly.*/
+    if (!(c->ssdb_conn_flags & CONN_SUCCESS) ||
+        !c->context || c->context->fd <= 0) {
+        if (isSpecialConnection(c))
+            freeClient(c);
+        else {
+            if ((c->ssdb_conn_flags & CONN_CONNECTING) ||
+                (c->flags & CLIENT_MASTER && (c->ssdb_conn_flags & CONN_CHECK_REPOPID)))
+                serverLog(LL_DEBUG, "ssdb connection status is connecting");
+            else
+                serverLog(LL_DEBUG, "ssdb connection status is disconnected");
+        }
+        sdsfree(finalcmd);
+        return C_FD_ERR;
+    }
+
+    if (!finalcmd) {
+        cmd = lookupCommand(c->argv[0]->ptr);
+        if (!cmd || !(cmd->flags & CMD_SWAP_MODE)
+            || (c->flags & CLIENT_MULTI))
+            return C_ERR;
+
+        finalcmd = composeCmdFromArgs(c->argc, c->argv);
+    }
+
+    if (!finalcmd) {
+        serverLog(LL_WARNING, "out of memory!");
+        return C_ERR;
+    }
+
+    serverLog(LL_DEBUG, "sendCommandToSSDB context fd: %d, redis fd:%d",
+              c->context ? c->context->fd : -1, c->fd);
+
+    return internalSendCommandToSSDB(c, finalcmd);
+}
+
+void sendFlushCheckCommandToSSDB(aeEventLoop *el, int fd, void *privdata, int mask) {
+    client *c = (client *)privdata;
+    UNUSED(mask);
+    UNUSED(el);
+    UNUSED(fd);
+
+    sds finalcmd = sdsnew("*1\r\n$17\r\nrr_flushall_check\r\n");
+    if (sendCommandToSSDB(c, finalcmd) != C_OK) {
+        if ((c->ssdb_conn_flags & CONN_WAIT_FLUSH_CHECK_REPLY) && server.flush_check_begin_time != -1) {
+            server.flush_check_unresponse_num -= 1;
+            c->ssdb_conn_flags &= ~CONN_WAIT_FLUSH_CHECK_REPLY;
+            serverLog(LL_DEBUG, "[flushall]connection(c->context->fd:%d,c->fd:%d) with ssdb disconnected, unresponse num:%d",
+                      c->context ? c->context->fd : -1, c->fd, server.flush_check_unresponse_num);
+        }
+    } else {
+        aeDeleteFileEvent(server.el, c->fd, AE_WRITABLE);
+        serverLog(LL_DEBUG, "[flushall]send flush check sucess, c->flags:%d, c->ssdb_conn_flags:%d",
+                  c->flags, c->ssdb_conn_flags);
+    }
+}
+
+void sendCheckWriteCommandToSSDB(aeEventLoop *el, int fd, void *privdata, int mask) {
+    client *c = (client *)privdata;
+    UNUSED(mask);
+    UNUSED(el);
+    UNUSED(fd);
+
+    /* Expect the response of rr_check_write as 'rr_check_write ok/nok'. */
+    sds finalcmd = sdsnew("*1\r\n$14\r\nrr_check_write\r\n");
+
+    if (sendCommandToSSDB(c, finalcmd) != C_OK) {
+        serverLog(LL_DEBUG, "Sending rr_check_write to SSDB failed.");
+        if (c->ssdb_conn_flags & CONN_WAIT_WRITE_CHECK_REPLY && server.check_write_begin_time != -1) {
+            server.check_write_unresponse_num -= 1;
+            c->ssdb_conn_flags &= ~CONN_WAIT_WRITE_CHECK_REPLY;
+            serverLog(LL_DEBUG, "[replication check write]connection with ssdb disconnected, unresponse num:%d",
+                      server.check_write_unresponse_num);
+        }
+    } else {
+        serverLog(LL_DEBUG, "Replication log: Sending rr_check_write to SSDB, fd: %d, rr_check_write counter: %d",
+                  fd, server.check_write_unresponse_num);
+        aeDeleteFileEvent(server.el, c->fd, AE_WRITABLE);
+    }
+}
+
+
 #define MAX_ACCEPTS_PER_CALL 1000
 static void acceptCommonHandler(int fd, int flags, char *ip) {
     client *c;
@@ -670,6 +1072,21 @@ static void acceptCommonHandler(int fd, int flags, char *ip) {
 
     server.stat_numconnections++;
     c->flags |= flags;
+
+    if (server.swap_mode) {
+        strncpy(c->client_ip, ip, NET_IP_STR_LEN);
+
+        if (server.is_doing_flushall) {
+            /* maybe redis is doing flush check before flushall, will connect SSDB later.*/
+            c->ssdb_conn_flags |= CONN_CONNECT_FAILED;
+            serverLog(LL_DEBUG, "is doing flushall, will connnect SSDB later.");
+        } else if (server.ssdb_status > SSDB_NONE && server.ssdb_status < MASTER_SSDB_SNAPSHOT_PRE) {
+            /* redis is doing write check before replication, will connect SSDB later. */
+            c->ssdb_conn_flags |= CONN_CONNECT_FAILED;
+            serverLog(LL_DEBUG, "is doing write check for replication, will connnect SSDB later.");
+        } else if (C_OK != nonBlockConnectToSsdbServer(c))
+            serverLog(LL_DEBUG, "connect ssdb failed, will retry to connect.");
+    }
 }
 
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -711,10 +1128,1091 @@ void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 }
 
+void handleClientsBlockedOnFlushall(void) {
+    listIter li;
+    listNode *ln;
+    int ret;
+
+    listRewind(server.ssdb_flushall_blocked_clients, &li);
+    while((ln = listNext(&li))) {
+        client *c = listNodeValue(ln);
+        listDelNode(server.ssdb_flushall_blocked_clients, ln);
+
+        serverLog(LL_DEBUG, "[!!!!]unblocked by handleClientsBlockedOnFlushall:%p", (void*)c);
+        unblockClient(c);
+
+        /* Convert block type. */
+        if ((ret = tryBlockingClient(c)) != C_OK) {
+            /* C_NOTSUPPORT_ERR should be handled before. */
+            serverAssert(ret != C_NOTSUPPORT_ERR);
+            continue;
+        }
+
+        if (runCommand(c) == C_OK)
+            resetClient(c);
+    }
+}
+
+void handleClientsBlockedOnMigrate(void) {
+    listIter li;
+    listNode *ln;
+
+    listRewind(server.delayed_migrate_clients, &li);
+    while((ln = listNext(&li))) {
+        client *c = listNodeValue(ln);
+        if (checkKeysForMigrate(c) == C_OK) {
+            listDelNode(server.delayed_migrate_clients, ln);
+            unblockClient(c);
+            serverLog(LL_DEBUG, "client migrate list del: %ld", (long)c);
+            if (runCommand(c) == C_OK)
+                resetClient(c);
+        }
+    }
+}
+
+static void revertClientBufReply(client *c, size_t revertlen) {
+    listNode *ln;
+    sds tail;
+
+    if (c->flags & CLIENT_MASTER) return;
+
+    while (revertlen > 0) {
+        if (listLength(c->reply) > 0
+            && (ln = listLast(c->reply))
+            && (tail = listNodeValue(ln))) {
+            size_t length = sdslen(tail);
+
+            if (length > revertlen) {
+                sdsrange(tail, 0, length - revertlen - 1);
+                c->reply_bytes -= revertlen;
+                break;
+            } else if (length == revertlen) {
+                listDelNode(c->reply, ln);
+                c->reply_bytes -= length;
+                break;
+            } else {
+                listDelNode(c->reply, ln);
+                c->reply_bytes -= length;
+                revertlen -= length;
+            }
+        } else {
+            /* Only need to handle c->buf. */
+            serverAssert(c->bufpos >= (int)revertlen);
+            c->bufpos -= revertlen;
+            break;
+        }
+    }
+}
+
+#define IsReplyEqual(reply, sds_response) (sdslen(sds_response) == (size_t)(reply)->len && \
+    0 == memcmp((reply)->str, sds_response, (reply)->len))
+
+int handleResponseOfSlaveSSDBflush(client *c, redisReply* reply) {
+    if (server.master == c || server.cached_master == c) {
+        if (c->cmd && c->btype == BLOCKED_BY_FLUSHALL && c->cmd->proc == flushallCommand) {
+            struct ssdb_write_op* op;
+            listNode *ln;
+            redisReply* reply2, *repoid_response;
+            time_t resp_op_time;
+            int resp_op_index;
+            int ret;
+
+            ln = listFirst(server.ssdb_write_oplist);
+            op = ln->value;
+            if (op->cmd->proc != flushallCommand) {
+                 /* this is not a response of this "flushall" command. */
+                serverLog(LL_DEBUG, "this is not a response of this 'flushall' command");
+                return C_OK;
+            }
+
+            reply2 = c->ssdb_replies[1];
+            repoid_response = reply2->element[1];
+            ret = sscanf(repoid_response->str, "repopid %ld %d", &resp_op_time, &resp_op_index);
+            serverAssert(2 == ret);
+            if (resp_op_time == op->time && resp_op_index == op->index) {
+                /* this is the response of 'flushall' */
+                unblockClient(c);
+                resetClient(c);
+                if (IsReplyEqual(reply, shared.flushdoneok)){
+                    /* ssdb flushall success, we can remove it from ssdb_write_oplist. */
+                    serverLog(LL_DEBUG, "received ssdb flushall response");
+                    listDelNode(server.ssdb_write_oplist, ln);
+                    /* if conn status of server.master/server.cached_master is not CONN_SUCCESS,
+                     * continue to process the rest failed writes. */
+                    if (c->flags & CLIENT_MASTER && !(c->ssdb_conn_flags & CONN_SUCCESS))
+                        confirmAndRetrySlaveSSDBwriteOp(c, -1, -1);
+                } else {
+                    /* close SSDB connection and we will retry flushall after connected. */
+                    closeAndReconnectSSDBconnection(c);
+                }
+                serverLog(LL_DEBUG, "server.master/server.cached_master client is unblocked");
+                return C_RETURN;
+            } else {
+                /* this is not a response of this "flushall" command. */
+                serverLog(LL_DEBUG, "this is not a response of this 'flushall' command");
+                return C_OK;
+            }
+        }
+        return C_OK;
+    } else {
+        return C_RETURN;
+    }
+}
+
+int handleResponseOfSSDBflushDone(client *c, redisReply* reply, int revert_len) {
+    int process_status;
+    client* cur_flush_client;
+    UNUSED(c);
+
+    if (IsReplyEqual(reply, shared.flushdoneok) || IsReplyEqual(reply, shared.flushdonenok)) {
+        if (server.is_doing_flushall) {
+            /* clean the ssdb reply*/
+            revertClientBufReply(c, revert_len);
+
+            cur_flush_client = server.current_flushall_client;
+
+            /* unblock the client doing flushall. */
+            unblockClient(cur_flush_client);
+            resetClient(cur_flush_client);
+            if (IsReplyEqual(reply, shared.flushdoneok)) {
+                serverLog(LL_DEBUG, "[flushall] receive do flush ok");
+            } else if (IsReplyEqual(reply, shared.flushdonenok)) {
+                serverLog(LL_DEBUG, "[flushall] receive do flush nok, ssdb flushall failed");
+            }
+            handleClientsBlockedOnFlushall();
+        } else {
+            /* unexpected response, revert it to avoid be send to user client. */
+            revertClientBufReply(c, revert_len);
+            serverLog(LL_DEBUG, "unexpected response:%s", reply->str);
+        }
+        process_status = C_OK;
+    } else
+        process_status = C_ERR;
+
+    return process_status;
+}
+
+void doSSDBflushIfCheckDone() {
+    if (server.flush_check_unresponse_num == 0) {
+        server.flush_check_begin_time = -1;
+        server.flush_check_unresponse_num = -1;
+
+        serverLog(LL_DEBUG, "[flushall]all flush check responses received, check ok");
+
+        sds finalcmd = sdsnew("*1\r\n$14\r\nrr_do_flushall\r\n");
+        if (sendCommandToSSDB(server.current_flushall_client, finalcmd) != C_OK) {
+            /* set to 0 so flush check will be timeout. exception case
+             * of flush check will be processed in serverCron.*/
+            server.flush_check_begin_time = 0;
+            serverLog(LL_WARNING, "Sending rr_do_flushall to SSDB failed.");
+        } else {
+            serverLog(LL_WARNING, "Sending rr_do_flushall to SSDB success.");
+
+            /* just empty redis before we receive response from SSDB, avoid dirty data issue.*/
+            call(server.current_flushall_client,CMD_CALL_FULL);
+            server.current_flushall_client->woff = server.master_repl_offset;
+        }
+    }
+}
+
+int handleResponseOfFlushCheck(client *c, redisReply* reply, int revert_len) {
+    int process_status;
+    UNUSED(c);
+
+    if (IsReplyEqual(reply, shared.flushcheckok)) {
+        revertClientBufReply(c, revert_len);
+        if (server.is_doing_flushall) {
+            server.flush_check_unresponse_num -= 1;
+
+            /* unset this flag here, if this client disconnect after we receive flushall-check response,
+             * we can ignore this client in freeClient and don't decrease server.flush_check_unresponse_num. */
+            c->ssdb_conn_flags &= ~CONN_WAIT_FLUSH_CHECK_REPLY;
+
+            serverLog(LL_DEBUG, "[flushall]receive flush check ok(c->context->fd:%d), unresponse num:%d",
+                      c->context ? c->context->fd : -1, server.flush_check_unresponse_num);
+            doSSDBflushIfCheckDone();
+        } else {
+            serverLog(LL_DEBUG, "unexpected response:%s", shared.flushcheckok);
+        }
+        process_status = C_OK;
+    } else if (IsReplyEqual(reply, shared.flushchecknok)) {
+        revertClientBufReply(c, revert_len);
+        if (server.is_doing_flushall) {
+            serverLog(LL_DEBUG, "[flushall]receive flush check failed response, check failed and abort");
+            /* set to 0 so flush check will be timeout. exception case
+             * of flush check will be processed in serverCron.*/
+            server.flush_check_begin_time = 0;
+        } else {
+            serverLog(LL_DEBUG, "unexpected response:%s", shared.flushchecknok);
+        }
+        process_status = C_OK;
+    } else
+        process_status = C_ERR;
+
+    return process_status;
+}
+
+void makeSSDBsnapshotIfCheckOK() {
+    if (server.check_write_unresponse_num == 0) {
+        server.check_write_begin_time = -1;
+        server.check_write_unresponse_num = -1;
+        server.ssdb_status = MASTER_SSDB_SNAPSHOT_PRE;
+
+        sds finalcmd = sdsnew("*1\r\n$16\r\nrr_make_snapshot\r\n");
+        if (sendCommandToSSDB(server.ssdb_replication_client, finalcmd) != C_OK) {
+            resetCustomizedReplication();
+            serverLog(LL_WARNING, "Replication log: Sending rr_make_snapshot to SSDB failed.");
+        } else {
+            /* will handle timeout case in replicationCron. */
+            server.make_snapshot_begin_time = server.unixtime;
+            serverLog(LL_DEBUG, "Replication log: Sending rr_make_snapshot to SSDB sucess.");
+        }
+    }
+}
+
+int handleResponseOfCheckWrite(client *c, redisReply* reply) {
+    int process_status;
+    UNUSED(c);
+
+    if (IsReplyEqual(reply, shared.checkwriteok)) {
+        if (server.ssdb_status == MASTER_SSDB_SNAPSHOT_CHECK_WRITE
+            && !isSpecialConnection(c)
+            && (c->ssdb_conn_flags & CONN_WAIT_WRITE_CHECK_REPLY)) {
+
+            /* Update check_write_unresponse_num. */
+             server.check_write_unresponse_num -= 1;
+
+             /* unset this flag here, if this client disconnect after we receive write-check response,
+              * we can ignore this client in freeClient and don't decrease server.check_write_unresponse_num. */
+             c->ssdb_conn_flags &= ~CONN_WAIT_WRITE_CHECK_REPLY;
+
+             serverLog(LL_DEBUG, "Replication log: rr_check_write fd: %d, counter: %d", c->fd,
+                       server.check_write_unresponse_num);
+
+            makeSSDBsnapshotIfCheckOK();
+        } else
+            serverLog(LL_DEBUG, "unexpected response:%s", shared.checkwriteok);
+
+        process_status = C_OK;
+    } else if (IsReplyEqual(reply, shared.checkwritenok)) {
+         if (server.ssdb_status == MASTER_SSDB_SNAPSHOT_CHECK_WRITE
+            && !isSpecialConnection(c)
+            && (c->ssdb_conn_flags & CONN_WAIT_WRITE_CHECK_REPLY)) {
+
+             /* Reset customized replication status immediately. */
+             resetCustomizedReplication();
+             serverLog(LL_WARNING, "SSDB returns 'rr_check_write nok'.");
+         } else
+             serverLog(LL_DEBUG, "unexpected response:%s", shared.checkwritenok);
+
+        process_status = C_OK;
+    } else
+        process_status = C_ERR;
+
+    return process_status;
+}
+
+int handleResponseOfPsync(client *c, redisReply* reply) {
+    int process_status;
+    UNUSED(c);
+
+    /* Reset is_allow_ssdb_write to ALLOW_SSDB_WRITE
+       as soon as rr_make_snapshot is responsed. */
+    if (IsReplyEqual(reply, shared.makesnapshotok)) {
+        if (c == server.ssdb_replication_client && server.ssdb_status == MASTER_SSDB_SNAPSHOT_PRE) {
+            server.make_snapshot_begin_time = -1;
+            server.ssdb_snapshot_timestamp = mstime();
+            server.ssdb_status = MASTER_SSDB_SNAPSHOT_OK;
+        } else
+            serverLog(LL_DEBUG, "unexpected response:%s", shared.makesnapshotok);
+
+        process_status = C_OK;
+        serverLog(LL_DEBUG, "Replication log: rr_make_snapshot ok.");
+    } else if (IsReplyEqual(reply, shared.makesnapshotnok)) {
+        if (c == server.ssdb_replication_client && server.ssdb_status == MASTER_SSDB_SNAPSHOT_PRE) {
+            /* Reset customized replication status immediately. */
+            resetCustomizedReplication();
+        } else
+            serverLog(LL_DEBUG, "unexpected response:%s", shared.makesnapshotnok);
+
+        process_status = C_OK;
+    } else
+        process_status = C_ERR;
+
+    return process_status;
+}
+
+void sendDelSSDBsnapshot() {
+    sds cmdsds = sdsnew("*1\r\n$15\r\nrr_del_snapshot\r\n");
+
+    if (sendCommandToSSDB(server.ssdb_replication_client, cmdsds) != C_OK) {
+        server.retry_del_snapshot = 1;
+        serverLog(LL_DEBUG, "Sending rr_del_snapshot to SSDB failed. will retry!");
+    } else {
+        serverLog(LL_DEBUG, "Replication log: send rr_del_snapshot to SSDB");
+    }
+}
+
+int handleResponseOfDelSnapshot(client *c, redisReply* reply) {
+    int process_status;
+    UNUSED(c);
+
+    if (IsReplyEqual(reply, shared.delsnapshotok)) {
+        if (c == server.ssdb_replication_client) {
+            if (server.ssdb_status == SSDB_NONE) {
+                server.retry_del_snapshot = 0;
+            }
+        } else
+            serverLog(LL_DEBUG, "unexpected response:%s", shared.delsnapshotok);
+
+        process_status = C_OK;
+    } else if (IsReplyEqual(reply, shared.delsnapshotnok)) {
+        if (c == server.ssdb_replication_client) {
+            if (server.ssdb_status == SSDB_NONE) {
+                server.retry_del_snapshot = 1;
+            }
+        } else
+            serverLog(LL_DEBUG, "unexpected response:%s", shared.delsnapshotok);
+
+        process_status = C_OK;
+    } else
+        process_status = C_ERR;
+
+    return process_status;
+}
+
+int handleResponseTimeoutOfTransferSnapshot(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    client* c = clientData;
+    UNUSED(eventLoop);
+    UNUSED(id);
+
+    c->repl_timer_id = -1;
+    if (c->ssdb_status == SLAVE_SSDB_SNAPSHOT_TRANSFER_PRE)
+        freeClientAsync(c);
+
+    /* we only use this timer once, remove it. */
+    return AE_NOMORE;
+}
+
+int handleResponseOfTransferSnapshot(client *c, redisReply* reply) {
+    int process_status;
+
+    if (IsReplyEqual(reply, shared.transfersnapshotok)) {
+        if ((c->flags & CLIENT_SLAVE) && c->ssdb_status == SLAVE_SSDB_SNAPSHOT_TRANSFER_PRE) {
+            if (c->repl_timer_id != -1) {
+                aeDeleteTimeEvent(server.el, c->repl_timer_id);
+                c->repl_timer_id = -1;
+            }
+
+            c->transfer_snapshot_last_keepalive_time = server.unixtime;
+            c->ssdb_status = SLAVE_SSDB_SNAPSHOT_TRANSFER_START;
+
+            serverLog(LL_DEBUG, "Replication log: transfersnapshotok, fd: %d", c->fd);
+            aeDeleteFileEvent(server.el, c->fd, AE_WRITABLE);
+            if (aeCreateFileEvent(server.el, c->fd, AE_WRITABLE,
+                                  sendBulkToSlave, c) == AE_ERR)
+                freeClientAsync(c);
+        } else
+            serverLog(LL_DEBUG, "unexpected response:%s", shared.transfersnapshotok);
+
+        process_status = C_OK;
+
+    } else if (IsReplyEqual(reply, shared.transfersnapshotnok)) {
+        if ((c->flags & CLIENT_SLAVE) && c->ssdb_status == SLAVE_SSDB_SNAPSHOT_TRANSFER_PRE) {
+            if (c->repl_timer_id != -1) {
+                aeDeleteTimeEvent(server.el, c->repl_timer_id);
+                c->repl_timer_id = -1;
+            }
+            serverAssert(server.ssdb_status == MASTER_SSDB_SNAPSHOT_OK);
+
+            serverLog(LL_DEBUG, "Replication log: transfersnapshotnok, fd: %d", c->fd);
+            addReplyError(c, "snapshot transfer nok");
+            freeClientAsync(c);
+        } else
+            serverLog(LL_DEBUG, "unexpected response:%s", shared.transfersnapshotnok);
+
+        process_status = C_OK;
+    } else if (IsReplyEqual(reply, shared.transfersnapshotcontinue)) {
+        if ((c->flags & CLIENT_SLAVE) && c->ssdb_status == SLAVE_SSDB_SNAPSHOT_TRANSFER_START) {
+            serverLog(LL_DEBUG, "Replication log: receive keepalive message, transfer ssdb snapshot continue...");
+            c->transfer_snapshot_last_keepalive_time = server.unixtime;
+        } else
+            serverLog(LL_DEBUG, "unexpected response:%s", shared.transfersnapshotcontinue);
+
+        process_status = C_OK;
+    } else if (IsReplyEqual(reply, shared.transfersnapshotfinished)) {
+        if ((c->flags & CLIENT_SLAVE) && c->ssdb_status == SLAVE_SSDB_SNAPSHOT_TRANSFER_START) {
+            serverLog(LL_DEBUG, "Replication log: snapshot transfer finished, fd: %d", c->fd);
+            c->ssdb_status = SLAVE_SSDB_SNAPSHOT_TRANSFER_END;
+        } else
+            serverLog(LL_DEBUG, "unexpected response:%s", shared.transfersnapshotfinished);
+
+        process_status = C_OK;
+    } else if (IsReplyEqual(reply, shared.transfersnapshotunfinished)) {
+        if ((c->flags & CLIENT_SLAVE) && c->ssdb_status == SLAVE_SSDB_SNAPSHOT_TRANSFER_START) {
+
+            serverAssert(server.ssdb_status == MASTER_SSDB_SNAPSHOT_OK);
+            serverLog(LL_DEBUG, "Replication log: snapshot transfer unfinished, fd: %d", c->fd);
+            addReplyError(c, "snapshot transfer unfinished");
+            freeClientAsync(c);
+        } else
+            serverLog(LL_DEBUG, "unexpected response:%s", shared.transfersnapshotunfinished);
+
+        process_status = C_OK;
+    } else
+        process_status = C_ERR;
+
+    return process_status;
+}
+
+int handleResponseOfExpiredDelete(client *c) {
+    redisReply *reply = c->ssdb_replies[0];
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        int j;
+        serverAssert(c->cmd->proc == delCommand);
+        for (j=1; j < c->argc; j++) {
+            serverLog(LL_DEBUG, "expired/evicted key: %s is deleted in ssdb", (char*)c->argv[j]->ptr);
+            dictDelete(EVICTED_DATA_DB->ssdb_keys_to_clean, c->argv[j]->ptr);
+        }
+    }
+    return C_OK;
+}
+
+int handleResponseOfDeleteCheckConfirm(client *c) {
+    redisReply *reply = c->ssdb_replies[0];
+
+    if (reply->type == REDIS_REPLY_INTEGER && reply->integer == 0) {
+        robj *argv[2] = {createStringObject("del", 3), c->argv[1]};
+
+        /* the keys is not exist in ssdb, delete its key index in redis. */
+        if (server.lazyfree_lazy_eviction)
+            dbAsyncDelete(EVICTED_DATA_DB, c->argv[1]);
+        else
+            dbSyncDelete(EVICTED_DATA_DB, c->argv[1]);
+
+        serverLog(LL_DEBUG, "key: %s is delete from EVICTED_DATA_DB->dict.", (char *)c->argv[1]->ptr);
+
+        propagate(server.delCommand, 0, argv, 2, PROPAGATE_REPL);
+        propagate(server.delCommand, EVICTED_DATA_DBID, argv, 2, PROPAGATE_AOF);
+        serverLog(LL_DEBUG, "propagate key: %s to slave", (char *)c->argv[1]->ptr);
+        decrRefCount(argv[0]);
+    } else if (reply->type == REDIS_REPLY_INTEGER && reply->integer == 1) {
+        serverLog(LL_DEBUG, "key: %s exists in ssdb", (char *)c->argv[1]->ptr);
+    } else {
+        /* response content is wrong. */
+        serverLog(LL_WARNING, "[!!!]delete-confirm response content is wrong.");
+    }
+
+    serverAssert(dictDelete(EVICTED_DATA_DB->delete_confirm_keys, c->argv[1]->ptr) == DICT_OK
+                 || dictDelete(server.maybe_deleted_ssdb_keys, c->argv[1]->ptr) == DICT_OK);
+    serverLog(LL_DEBUG, "delete_confirm_key: %s is deleted.", (char *)c->argv[1]->ptr);
+    /* Queue the ready key to ssdb_ready_keys. */
+    signalBlockingKeyAsReady(c->db, c->argv[1]);
+
+    return C_OK;
+}
+
+void checkSSDBkeyIsDeleted(char* check_reply, struct redisCommand* cmd, int argc, robj** argv) {
+    int *indexs = NULL;
+    int numkeys = 0;
+    sds key;
+
+    if (check_reply && !strcmp(check_reply, "check 1")) {
+        indexs = getKeysFromCommand(cmd, argv, argc, &numkeys);
+
+        key = argv[indexs[0]]->ptr;
+
+        if (NULL == dictFind(EVICTED_DATA_DB->delete_confirm_keys, key))
+            dictAddOrFind(server.maybe_deleted_ssdb_keys, key);
+
+        serverLog(LL_DEBUG, "cmd: %s, key: %s is added to delete_confirm_keys.", cmd->name, key);
+
+        if (indexs) getKeysFreeResult(indexs);
+    }
+}
+
+/* Handle the common extra reply from SSDB:
+ response format:
+ 1) *1\r\n$7\r\ncheck 0\r\n
+ 2) *1\r\n$7\r\ncheck 1\r\n
+ 3) for the replication connection of slave redis:
+    *2\r\n$7\r\ncheck 0\r\n$100 \r\nrepopid ${time} ${index}\r\n
+ */
+int handleExtraSSDBReply(client *c) {
+    redisReply *element0, *element1, *reply;
+
+    reply = c->ssdb_replies[1];
+
+    serverAssert(reply->type == REDIS_REPLY_ARRAY);
+    element0 = reply->element[0];
+    serverAssert(element0->type == REDIS_REPLY_STRING);
+    serverLog(LL_DEBUG, "check reply:%s", element0->str);
+
+    if (server.master == c || server.cached_master == c) {
+        /* process "repopid" response for slave redis. */
+        serverAssert(reply->elements == 2);
+        time_t repopid_time;
+        int repopid_index;
+        struct ssdb_write_op* op;
+        listNode *ln;
+        int ret;
+
+        element1 = reply->element[1];
+        ret = sscanf(element1->str,"repopid %ld %d", &repopid_time, &repopid_index);
+
+        serverAssert(2 == ret);
+        if (2 != ret) {
+            serverLog(LL_WARNING, "wrong format of repopid response :%s", reply->str);
+            server.slave_ssdb_critical_err_cnt++;
+            closeAndReconnectSSDBconnection(c);
+            return C_ERR;
+        }
+
+#define SSDB_INITIAL_REPOPID_INDEX 0
+#define SSDB_INITIAL_REPOPID_TIME 1
+        if (SSDB_INITIAL_REPOPID_INDEX == repopid_index && SSDB_INITIAL_REPOPID_TIME == repopid_time) {
+            /* this is a response of the first "repopid set" request. */
+            return C_OK;
+        }
+
+        if (0 == listLength(server.ssdb_write_oplist)) return C_OK;
+
+        ln = listFirst(server.ssdb_write_oplist);
+        op = ln->value;
+        if ((repopid_time < op->time) || (repopid_time == op->time && repopid_index < op->index)) {
+            /* this may caused by a previous 'flushall' which would empty server.ssdb_write_oplist
+             * and visiting_ssdb_keys. see processCommandMaybeFlushdb. */
+            return C_OK;
+        }
+
+        if (repopid_index == op->index && repopid_time == op->time) {
+            serverLog(LL_DEBUG, "[REPOPID DONE]ssdb process (key: %s, cmd: %s, op time:%ld, op id:%d) success,"
+                              " remove from write op list", op->argc > 1 ? (sds)op->argv[1]->ptr : "",
+                      op->cmd->name, op->time, op->index);
+            /* for server.master connection of slave, we check whether the key is deleted when
+             * there are no other write commands on this key, that is to say, when this key is
+             * removed from visiting_ssdb_keys)*/
+            if (removeVisitingSSDBKey(op->cmd, op->argc, op->argv))
+                checkSSDBkeyIsDeleted(element0->str, op->cmd, op->argc, op->argv);
+            listDelNode(server.ssdb_write_oplist, ln);
+        } else {
+            serverLog(LL_DEBUG, "repopid time/index don't match the first in server.ssdb_write_oplist");
+            closeAndReconnectSSDBconnection(c);
+            return C_ERR;
+        }
+    } else {
+        if (!isSpecialConnection(c))
+            checkSSDBkeyIsDeleted(element0->str, c->cmd, c->argc, c->argv);
+    }
+
+    return C_OK;
+}
+
+int handleResponseOfReplicationConn(client* c, redisReply* reply) {
+    if (c != server.master && c != server.cached_master) return C_ERR;
+
+    if (c->flags & CLIENT_MASTER && c->ssdb_conn_flags & CONN_CHECK_REPOPID) {
+        if (reply && reply->type == REDIS_REPLY_STRING && reply->str) {
+            /* we received response of "repopid get" */
+            time_t last_successful_write_time = -1;
+            int last_successful_write_index = -1;
+
+            int ret = sscanf(reply->str, "repopid %ld %d", &last_successful_write_time, &last_successful_write_index);
+            serverAssert(2 == ret);
+            if (2 != ret) {
+                server.slave_ssdb_critical_err_cnt++;
+                serverLog(LL_WARNING, "wrong format of repopid check response:%s", reply->str);
+                closeAndReconnectSSDBconnection(c);
+            } else {
+                serverLog(LL_DEBUG, "[REPOPID CHECK] get ssdb last success write(op time:%ld, op id:%d)",
+                          last_successful_write_time, last_successful_write_index);
+
+                 /* reset this flag*/
+                server.slave_failed_retry_interrupted = 0;
+                server.blocked_write_op = NULL;
+
+                /* may be blocked by transfer/loading/replication, fix swap-71 relication_4-2 issue */
+                if (c->flags & CLIENT_BLOCKED) {
+                    if (c->btype == BLOCKED_BY_FLUSHALL) {
+                        struct ssdb_write_op* op;
+                        listNode *ln;
+                        ln = listFirst(server.ssdb_write_oplist);
+                        op = ln->value;
+
+                        serverAssert(op->cmd->proc == flushallCommand && 1 == listLength(server.ssdb_write_oplist));
+                    } else {
+                        removeSuccessWriteop(last_successful_write_time, last_successful_write_index);
+                        /* we will re-send failed writes to ssdb after server.master is unblocked. */
+                        server.send_failed_write_after_unblock = 1;
+                    }
+                } else
+                    confirmAndRetrySlaveSSDBwriteOp(c, last_successful_write_time, last_successful_write_index);
+            }
+        } else {
+            serverLog(LL_WARNING, "failed to get repopid of slave ssdb, reply type:%d", reply->type);
+            server.slave_ssdb_critical_err_cnt++;
+            closeAndReconnectSSDBconnection(c);
+        }
+        c->ssdb_conn_flags &= ~CONN_CHECK_REPOPID;
+        return C_OK;
+    }
+
+    if (IsReplyEqual(reply, shared.repopidsetok)) {
+        /* receive "repopid setok", do nothing */
+        return C_OK;
+    }
+
+    if (reply->type == REDIS_REPLY_ERROR) {
+        server.slave_ssdb_critical_err_cnt++;
+        serverLog(LL_WARNING, "slave ssdb write error:%s", reply->str);
+    }
+    if (handleResponseOfSlaveSSDBflush(c, reply) == C_RETURN)
+        return C_OK;
+
+    handleExtraSSDBReply(c);
+    return C_OK;
+}
+
+int isThisKeyVisitingWriteSSDB(sds key)
+{
+    dictEntry *entry = dictFind(EVICTED_DATA_DB->visiting_ssdb_keys, key);
+    if (!entry) return 0;
+
+    uint32_t visiting_write_num = dictGetVisitingSSDBwriteCount(entry);
+    if (visiting_write_num > 0)
+        return 1;
+    else
+        return 0;
+}
+
+int removeVisitingSSDBKey(struct redisCommand *cmd, int argc, robj** argv) {
+    int *keys = NULL, numkeys = 0, j;
+    int removed = 0;
+
+    if ( (cmd->flags & (CMD_READONLY | CMD_WRITE)) &&
+         (cmd->flags & CMD_SWAP_MODE) ) {
+        keys = getKeysFromCommand(cmd, argv, argc, &numkeys);
+        /* in swap_mode, we only support one key command. */
+        if (numkeys > 0) serverAssert(1 == numkeys);
+
+        for (j = 0; j < numkeys; j ++) {
+            robj* key = argv[keys[j]];
+            dictEntry *entry = dictFind(EVICTED_DATA_DB->visiting_ssdb_keys, key->ptr);
+            uint32_t visiting_write_num = dictGetVisitingSSDBwriteCount(entry);
+            uint32_t visiting_read_num = dictGetVisitingSSDBreadCount(entry);
+
+            serverAssert(entry && ((visiting_read_num >= 1 && cmd->flags & CMD_READONLY) ||
+                         (visiting_write_num >= 1 && cmd->flags & CMD_WRITE)));
+
+            if (1 == (visiting_read_num+visiting_write_num)) {
+                /* only this client is visiting the specified key, remove the key
+                 * from visiting keys. */
+                dictDelete(EVICTED_DATA_DB->visiting_ssdb_keys, key->ptr);
+                serverLog(LL_DEBUG, "key: %s is deleted from visiting_ssdb_keys.", (char *) key->ptr);
+
+                /* if this key is in server.hot_keys, load it to redis immediately. for master only. */
+
+                /* NOTE: if there are some clients blocked by writing on the same key,
+                 * we can't load this key before process them. */
+                if (dictFind(server.hot_keys, key->ptr) &&
+                    NULL == dictFind(server.db[0].blocking_keys_write_same_ssdbkey, key))
+                    loadThisKeyImmediately(key->ptr);
+                removed = 1;
+            } else {
+                /* there are other clients visiting the specified key, just reduce the visiting
+                 * clients num by 1. */
+                if (cmd->flags & CMD_WRITE)
+                    dictSetVisitingSSDBwriteCount(entry, visiting_write_num-1);
+                else if (cmd->flags & CMD_READONLY)
+                    dictSetVisitingSSDBreadCount(entry, visiting_read_num-1);
+                removed = 0;
+            }
+        }
+
+        if (keys) getKeysFreeResult(keys);
+        return removed;
+    }
+    return -1;
+}
+
+int isSpecialConnection(client *c) {
+    if (c == server.ssdb_client
+        || c == server.slave_ssdb_load_evict_client
+        || c == server.ssdb_replication_client
+        || c == server.expired_delete_client
+        || c == server.delete_confirm_client)
+        return 1;
+    else
+        return 0;
+}
+
+int isSpecialCommand(client *c) {
+    if (c && c->cmd
+        && c->cmd->proc == migrateCommand)
+        return 1;
+    else
+        return 0;
+}
+
+int handleResponseOfMigrateDump(client *c) {
+    robj *keyobj = c->argv[3];
+    dictEntry *de = dictFind(EVICTED_DATA_DB->dict, keyobj->ptr);
+    redisDb *olddb;
+    redisReply *reply = c->ssdb_replies[0];
+    serverAssert(keyobj && de);
+
+    if (reply && c->btype == BLOCKED_MIGRATING_DUMP
+        && (reply->type == REDIS_REPLY_STRING
+            || reply->type == REDIS_REPLY_NIL)) {
+        olddb = c->db;
+        c->db = EVICTED_DATA_DB;
+
+        if (reply->type == REDIS_REPLY_NIL)
+            dbSyncDelete(c->db, keyobj);
+
+        call(c, CMD_CALL_FULL);
+        c->db = olddb;
+        return C_OK;
+    }
+
+    serverLog(LL_DEBUG, "c->btype: %d, reply->type: %d", c->btype, reply->type);
+    return C_ERR;
+}
+
+void handleSSDBReply(client *c, int revert_len) {
+    redisReply *reply;
+
+    reply = c->ssdb_replies[0];
+
+    if (reply && reply->type == REDIS_REPLY_ERROR)
+        serverLog(LL_WARNING, "Reply from SSDB is ERROR: %s, c->fd:%d, context fd:%d",
+                  reply->str, c->fd, c->context ? c->context->fd : -1);
+    if (reply && reply->type == REDIS_REPLY_STRING)
+        serverLog(LL_DEBUG, "reply str: %s, reply len:%lu", reply->str, reply->len);
+    if (reply && reply->type == REDIS_REPLY_INTEGER)
+        serverLog(LL_DEBUG, "reply integer: %lld", reply->integer);
+
+    /* Handle special connections. */
+    if (c == server.ssdb_client) return;
+
+    if ((c == server.master || c == server.cached_master) &&
+        handleResponseOfReplicationConn(c, reply) == C_OK) return;
+
+    if (c == server.expired_delete_client && handleResponseOfExpiredDelete(c) == C_OK) {
+        if (c->btype == BLOCKED_BY_EXPIRED_DELETE) {
+            unblockClient(c);
+            resetClient(c);
+        }
+        return;
+    }
+
+    if (c == server.delete_confirm_client && handleResponseOfDeleteCheckConfirm(c) == C_OK) {
+        if (c->btype == BLOCKED_BY_DELETE_CONFIRM) {
+            unblockClient(c);
+            resetClient(c);
+        }
+        return;
+    }
+
+    if (reply && reply->type == REDIS_REPLY_STRING) {
+        if (handleResponseOfFlushCheck(c, reply, revert_len) == C_OK) {
+            return;
+        }
+
+        if (handleResponseOfSSDBflushDone(c, reply, revert_len) == C_OK ) {
+            /* we need reply the flushall result to user client, so don't call revertClientBufReply. */
+            return;
+        }
+
+        /* Handle the response of rr_check_write. */
+        if (handleResponseOfCheckWrite(c, reply) == C_OK) {
+            revertClientBufReply(c, revert_len);
+            return;
+        }
+
+        /* Handle the response of rr_make_snapshot. */
+        if (handleResponseOfPsync(c, reply) == C_OK) {
+            return;
+        }
+
+        /* Handle the response of rr_transfer_snapshot. */
+        if (handleResponseOfTransferSnapshot(c, reply) == C_OK) {
+            revertClientBufReply(c, revert_len);
+            return;
+        }
+
+        /* Handle the respons of rr_del_snapshot. */
+        if (handleResponseOfDelSnapshot(c, reply) == C_OK) {
+            return;
+        }
+    }
+
+    handleExtraSSDBReply(c);
+
+    /* Unblock the client is reading/writing SSDB. */
+    if (c->btype == BLOCKED_VISITING_SSDB
+        || c->btype == BLOCKED_MIGRATING_DUMP) {
+
+        /* Handle the rest of migrating. */
+        if (c->cmd->proc == migrateCommand
+            && handleResponseOfMigrateDump(c) != C_OK) {
+            serverLog(LL_WARNING, "migrate log: failed to handle migrate dump.");
+            return;
+        }
+
+        propagateCmdHandledBySSDB(c);
+        server.stat_numcommands++;
+        unblockClient(c);
+        resetClient(c);
+        if (c->flags & CLIENT_CLOSE_AFTER_SSDB_WRITE_PROPAGATE)
+            freeClientAsync(c);
+    }
+}
+
+int syncReadReply(redisContext *c, void **reply, long long timeout) {
+    void *aux = NULL;
+    long long start = mstime();
+    long long elapsed;
+
+    /* Read until there is a reply */
+    do {
+        if (redisBufferRead(c) == REDIS_ERR)
+            return REDIS_ERR;
+        if (redisGetReplyFromReader(c,&aux,NULL) == REDIS_ERR)
+            return REDIS_ERR;
+
+        elapsed = mstime() - start;
+
+        if (elapsed >= timeout)
+            return REDIS_ERR;
+    } while (aux == NULL);
+
+    *reply = aux;
+
+    return REDIS_OK;
+}
+
+#define AE_BUFFER_HAVE_UNPROCESSED_DATA AE_WRITABLE
+void ssdbClientUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    UNUSED(el);
+    UNUSED(mask);
+    UNUSED(fd);
+
+    client * c = (client *)privdata;
+    void *aux = NULL;
+    int flags = CMD_CALL_FULL;
+    long long duration;
+
+    if (!c || !c->context)
+        return;
+
+    int total_reply_len = 0;
+    redisReader *r = c->context->reader;
+    char* reply_start;
+
+    do {
+        int conn_read_bytes = 0;
+        int reply_len = 0;
+        int oldlen = r->len;
+
+        if (redisBufferRead(c->context) == REDIS_OK) {
+
+            /* the returned 'aux' may be NULL when redisGetReplyFromReader return REDIS_OK,
+             * so we may need to read multiple times to get a completed response. */
+            conn_read_bytes = r->len - oldlen;
+        }
+
+        /* encountered a read error. */
+        if (c->context->err) {
+            serverLog(LL_WARNING, "ssdb read error: %s ", c->context->errstr);
+
+            if (isSpecialConnection(c)) {
+                freeClient(c);
+                return;
+            } else {
+                if (c->ssdb_replies[0])
+                    revertClientBufReply(c, c->revert_len);
+                else
+                    revertClientBufReply(c, total_reply_len);
+
+                /* we don't need to reply to server.master and server.delete_confirm_client. */
+                if (c->btype == BLOCKED_VISITING_SSDB
+                    || c->btype == BLOCKED_MIGRATING_DUMP
+                    || c->btype == BLOCKED_BY_FLUSHALL) {
+                    unblockClient(c);
+                    resetClient(c);
+                    if (c->flags & CLIENT_CLOSE_AFTER_SSDB_WRITE_PROPAGATE) {
+                        freeClient(c);
+                        return;
+                    }
+                    /* only reply to redis user client when there is a write/read SSDB request. */
+                    addReplyError(c, "SSDB disconnect when read");
+                }
+                closeAndReconnectSSDBconnection(c);
+                goto clean;
+            }
+        }
+
+        /* the returned 'aux' may be NULL when redisGetReplyFromReader return REDIS_OK */
+        if (redisGetSSDBreplyFromReader(c->context, &aux, &reply_len) == REDIS_ERR)
+            break;
+        total_reply_len += reply_len;
+
+       /* maybe we don't get a reply, but r->pos maybe has changed.*/
+        if (!c->ssdb_replies[0]) {
+            if (reply_len) {
+                reply_start = r->buf+r->pos-reply_len;
+                /* Forbid to reply to client when cmd is spacial,
+                   the intermedia will be handled. */
+                if (!isSpecialConnection(c) && !isSpecialCommand(c))
+                    addReplyString(c, reply_start, reply_len);
+                /*
+                 * Discard part of the buffer in these two cases:
+                 * 1. when we've consumed at least 1024 bytes and
+                 * unprocessed data length is less than 10K bytes.
+                 * 2. when we've consumed at least 1M bytes.
+                 * to avoid doing unnecessary calls to memmove() in sds.c.
+                 * */
+
+                /* NOTE: discardSSDBreaderBuffer may change r->pos */
+                if (r->pos >= 1024 &&
+                    (r->pos > (r->len - r->pos)/10 || r->pos > 1024000))
+                    discardSSDBreaderBuffer(c->context->reader, 1024);
+            }
+        }
+
+        /* if we have not read any data, and there is no enough data in the reader
+        * buffer to construct a integral reply, just return and avoid to waste CPU.
+        *
+        * we will enter this callback again if new data arrive. */
+        if (!aux && conn_read_bytes == 0) {
+            if (!c->ssdb_replies[0]) {
+                c->revert_len += total_reply_len;
+            }
+            return;
+        }
+
+        /* we get a reply, record 1th reply. */
+        if (aux && !c->ssdb_replies[0]) {
+            /* save the first reply len and we may need to revert it from the user buffer.*/
+            c->revert_len += total_reply_len;
+            /* reset total reply len for the second reply. */
+            total_reply_len = 0;
+            c->ssdb_replies[0] = aux;
+            aux = NULL;
+
+            serverAssert(!c->ssdb_replies[1]);
+
+            /* the returned 'aux' may be NULL when redisGetReplyFromReader return REDIS_OK */
+            /* the 'redisBufferRead' may read muliple responses, so we just try to get the sencond replies. */
+            if (redisGetSSDBreplyFromReader(c->context, &aux, &reply_len) == REDIS_ERR)
+                break;
+            total_reply_len += reply_len;
+        }
+
+        /* Record 2th reply. */
+        if (aux && c->ssdb_replies[0] && !c->ssdb_replies[1]) {
+            c->ssdb_replies[1] = aux;
+            /* NOTE: discardSSDBreaderBuffer may change r->pos */
+            if (r->pos >= 1024 &&
+                (r->pos > (r->len - r->pos)/10 || r->pos > 1024000))
+                discardSSDBreaderBuffer(c->context->reader, 1024);
+
+            break;
+        }
+    } while (aux == NULL);
+
+    /* this is a protocol error, free the client. */
+    if (c->context->err) {
+        serverLog(LL_WARNING, "redis reader protocol error!");
+        freeClient(c);
+        return;
+    }
+    serverAssert(c->ssdb_replies[0] && c->ssdb_replies[1]);
+
+    /* check if the second reply is 'check 0' or 'check 1' */
+    if (c->ssdb_replies[1]) {
+        redisReply* reply = c->ssdb_replies[1];
+        redisReply* element = reply->element[0];
+
+        if ( reply->type != REDIS_REPLY_ARRAY ||
+             (element->type != REDIS_REPLY_STRING || (strcmp(element->str, "check 1") && strcmp(element->str, "check 0"))) ) {
+            freeClient(c);
+            return;
+        }
+    }
+
+    /* the redisBufferRead function may read more than two ssdb replies, the rest replies
+     * will be stored in the buffer of c->context->reader, use writeable fd event
+     * to trigger this callback again, to avoid the rest replies not processed. */
+    if (r->len - r->pos != 0) {
+        aeCreateFileEvent(server.el, c->context->fd,
+                              AE_BUFFER_HAVE_UNPROCESSED_DATA, ssdbClientUnixHandler, c);
+    } else {
+        aeDeleteFileEvent(server.el, c->context->fd, AE_BUFFER_HAVE_UNPROCESSED_DATA);
+    }
+
+    /* When EVAL is called loading the AOF we don't want commands called
+     * from Lua to go into the slowlog or to populate statistics. */
+    if (server.loading && c->flags & CLIENT_LUA)
+        flags &= ~(CMD_CALL_SLOWLOG | CMD_CALL_STATS);
+
+
+    if (!isSpecialConnection(c) && !(c->flags & CLIENT_MASTER)) {
+        duration = ustime() - c->visit_ssdb_start;
+        /* Log the command into the Slow log if needed, and populate the
+         * per-command statistics that we show in INFO commandstats. */
+        if (flags & CMD_CALL_SLOWLOG && c->cmd && c->cmd->proc != execCommand
+            && !isSpecialConnection(c) && !(c->flags & CLIENT_MASTER)) {
+            char *latency_event = (c->cmd->flags & CMD_FAST) ?
+                "fast-command" : "command";
+            latencyAddSampleIfNeeded(latency_event,duration/1000);
+            slowlogPushEntryIfNeeded(c,c->argv,c->argc,duration);
+        }
+    }
+
+    handleSSDBReply(c, c->revert_len);
+
+clean:
+    c->revert_len = 0;
+    if (c->ssdb_replies[0]) {
+        freeReplyObject(c->ssdb_replies[0]);
+        c->ssdb_replies[0] = NULL;
+    }
+    if (c->ssdb_replies[1]) {
+        freeReplyObject(c->ssdb_replies[1]);
+        c->ssdb_replies[1] = NULL;
+    }
+}
+
+client* createSpecialSSDBclient() {
+    client* c;
+
+    c = createClient(-1);
+    if (!c) {
+        serverLog(LL_WARNING, "Error creating specical SSDB client.");
+        return NULL;
+    }
+
+    nonBlockConnectToSsdbServer(c);
+
+    return c;
+}
+
+void connectSepecialSSDBclients() {
+    server.ssdb_client = createSpecialSSDBclient();
+    server.ssdb_replication_client = createSpecialSSDBclient();
+    server.slave_ssdb_load_evict_client = createSpecialSSDBclient();
+    server.delete_confirm_client = createSpecialSSDBclient();
+    server.expired_delete_client = createSpecialSSDBclient();
+}
+
 static void freeClientArgv(client *c) {
     int j;
-    for (j = 0; j < c->argc; j++)
-        decrRefCount(c->argv[j]);
+
+    if (c->argv)
+        for (j = 0; j < c->argc; j++)
+            decrRefCount(c->argv[j]);
     c->argc = 0;
     c->cmd = NULL;
 }
@@ -742,14 +2240,49 @@ void unlinkClient(client *c) {
      * If the client was already unlinked or if it's a "fake client" the
      * fd is already set to -1. */
     if (c->fd != -1) {
+
+        /* Remove from the new added lists in swap-mode. */
+        if (server.swap_mode) {
+            dictIterator *di;
+            dictEntry *de;
+            robj *keyobj;
+
+            ln = listSearchKey(server.ssdb_flushall_blocked_clients, c);
+            if (ln) listDelNode(server.ssdb_flushall_blocked_clients, ln);
+
+            ln = listSearchKey(server.no_writing_ssdb_blocked_clients, c);
+            if (ln) listDelNode(server.no_writing_ssdb_blocked_clients, ln);
+
+            ln = listSearchKey(server.delayed_migrate_clients, c);
+            if (ln) {
+                listDelNode(server.delayed_migrate_clients, ln);
+                serverLog(LL_DEBUG, "client migrate list del: %ld", (long)c);
+            }
+
+            di = dictGetSafeIterator(server.db->ssdb_blocking_keys);
+            while((de = dictNext(di))) {
+                keyobj = dictGetKey(de);
+
+                removeClientFromListForBlockedKey(c, server.db->ssdb_blocking_keys, keyobj);
+            }
+            dictReleaseIterator(di);
+
+            di = dictGetSafeIterator(server.db->blocking_keys_write_same_ssdbkey);
+            while((de = dictNext(di))) {
+                keyobj = dictGetKey(de);
+
+                removeClientFromListForBlockedKey(c, server.db->blocking_keys_write_same_ssdbkey, keyobj);
+            }
+            dictReleaseIterator(di);
+        }
+
         /* Remove from the list of active clients. */
         ln = listSearchKey(server.clients,c);
         serverAssert(ln != NULL);
         listDelNode(server.clients,ln);
 
         /* Unregister async I/O handlers and close the socket. */
-        aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
-        aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
+        aeDeleteFileEvent(server.el,c->fd,AE_READABLE|AE_WRITABLE);
         close(c->fd);
         c->fd = -1;
     }
@@ -772,6 +2305,35 @@ void unlinkClient(client *c) {
     }
 }
 
+void resetSpecialCient(client *c) {
+    if (c == server.ssdb_client) {
+        /* for master */
+        if (!server.masterhost) cleanAndSignalLoadingOrTransferringKeys();
+        server.ssdb_client = NULL;
+    }
+
+    if (c == server.ssdb_replication_client)
+        server.ssdb_replication_client = NULL;
+
+    if (c == server.slave_ssdb_load_evict_client) {
+        /* for slave */
+        if (server.masterhost) cleanAndSignalLoadingOrTransferringKeys();
+        server.slave_ssdb_load_evict_client = NULL;
+    }
+
+    if (c == server.delete_confirm_client) {
+        cleanAndSignalDeleteConfirmKeys();
+        server.delete_confirm_client = NULL;
+    }
+
+    if (c == server.expired_delete_client)
+        server.expired_delete_client = NULL;
+
+    /* this is a normal client doing flushall. */
+    if (c == server.current_flushall_client)
+        server.current_flushall_client = NULL;
+}
+
 void freeClient(client *c) {
     listNode *ln;
 
@@ -782,14 +2344,46 @@ void freeClient(client *c) {
      * some unexpected state, by checking its flags. */
     if (server.master && c->flags & CLIENT_MASTER) {
         serverLog(LL_WARNING,"Connection with master lost.");
-        if (!(c->flags & (CLIENT_CLOSE_AFTER_REPLY|
-                          CLIENT_CLOSE_ASAP|
-                          CLIENT_BLOCKED|
-                          CLIENT_UNBLOCKED)))
+        if (server.swap_mode &&
+            !(c->flags & (CLIENT_CLOSE_AFTER_REPLY| CLIENT_CLOSE_ASAP))
+            && server.repl_state == REPL_STATE_CONNECTED)
+        {
+            if (c->flags & CLIENT_BLOCKED && c->btype == BLOCKED_SSDB_LOADING_OR_TRANSFER) {
+                removeBlockedKeysFromTransferOrLoadingKeys(c);
+
+                unblockClient(c);
+                if (c->flags & CLIENT_MASTER && server.slave_failed_retry_interrupted) {
+                    confirmAndRetrySlaveSSDBwriteOp(c, server.blocked_write_op->time, server.blocked_write_op->index);
+                } else {
+                    if (runCommand(c) == C_OK)
+                        resetClient(c);
+                    if (c->flags & CLIENT_MASTER && server.send_failed_write_after_unblock) {
+                        serverAssert(c->flags & CLIENT_MASTER && !(c->ssdb_conn_flags & CONN_SUCCESS));
+                        confirmAndRetrySlaveSSDBwriteOp(c, -1,-1);
+                        server.send_failed_write_after_unblock = 0;
+                    }
+                }
+            }
+            replicationCacheMaster(c);
+            if (c == server.cached_master
+                && c->flags & ( CLIENT_BLOCKED| CLIENT_UNBLOCKED)
+                && c->querybuf && sdslen(c->querybuf) > 0)
+                c->flags |= CLIENT_BUFFER_HAS_UNPROCESSED_DATA;
+            return;
+        } else if (!server.swap_mode
+                   && !(c->flags & (CLIENT_CLOSE_AFTER_REPLY|
+                                    CLIENT_CLOSE_ASAP| CLIENT_BLOCKED|
+                                    CLIENT_UNBLOCKED)) && server.repl_state == REPL_STATE_CONNECTED)
         {
             replicationCacheMaster(c);
             return;
         }
+    }
+
+    /* will close after we receive reply from SSDB and propagate. */
+    if (server.swap_mode && c->flags & CLIENT_BLOCKED && c->btype == BLOCKED_VISITING_SSDB) {
+        c->flags |= CLIENT_CLOSE_AFTER_SSDB_WRITE_PROPAGATE;
+        return;
     }
 
     /* Log link disconnection with slave */
@@ -806,6 +2400,8 @@ void freeClient(client *c) {
     /* Deallocate structures used to block on blocking ops. */
     if (c->flags & CLIENT_BLOCKED) unblockClient(c);
     dictRelease(c->bpop.keys);
+
+    if (server.swap_mode) dictRelease(c->bpop.loading_or_transfer_keys);
 
     /* UNWATCH all the keys */
     unwatchAllKeys(c);
@@ -825,6 +2421,17 @@ void freeClient(client *c) {
      * handlers, and remove references of the client from different
      * places where active clients may be referenced. */
     unlinkClient(c);
+
+    if (server.swap_mode) {
+        /* remove replication timeout timer. */
+        if (c->repl_timer_id != -1) {
+            aeDeleteTimeEvent(server.el, c->repl_timer_id);
+            c->repl_timer_id = -1;
+        }
+        /* handle ssdb connection */
+        handleSSDBconnectionDisconnect(c);
+    }
+
 
     /* Master/slave cleanup Case 1:
      * we lost the connection with a slave. */
@@ -855,6 +2462,13 @@ void freeClient(client *c) {
         ln = listSearchKey(server.clients_to_close,c);
         serverAssert(ln != NULL);
         listDelNode(server.clients_to_close,ln);
+    }
+
+    if (server.swap_mode) {
+        if (c->ssdb_replies[0]) freeReplyObject(c->ssdb_replies[0]);
+        if (c->ssdb_replies[1]) freeReplyObject(c->ssdb_replies[1]);
+
+        resetSpecialCient(c);
     }
 
     /* Release other dynamically allocated client structure fields,
@@ -1014,12 +2628,15 @@ int handleClientsWithPendingWrites(void) {
 
 /* resetClient prepare the client to process the next command */
 void resetClient(client *c) {
+    //serverLog(LL_DEBUG, "resetClient called: redis fd: %d, context fd:%d", c->fd, c->context ? c->context->fd : -1);
     redisCommandProc *prevcmd = c->cmd ? c->cmd->proc : NULL;
 
     freeClientArgv(c);
     c->reqtype = 0;
     c->multibulklen = 0;
     c->bulklen = -1;
+
+    if (server.swap_mode) c->first_key_index = 0;
 
     /* We clear the ASKING flag as well if we are not inside a MULTI, and
      * if what we just executed is not the ASKING command itself. */
@@ -1349,6 +2966,20 @@ void processInputBuffer(client *c) {
     server.current_client = NULL;
 }
 
+void processInputBufferOfMaster(client* c) {
+    serverAssert(c->flags & CLIENT_MASTER);
+    serverLog(LL_DEBUG, "slave_repl_offset:%lld,master_repl_offset:%lld",
+              c->reploff, server.master_repl_offset);
+    size_t prev_offset = c->reploff;
+    processInputBuffer(c);
+    size_t applied = c->reploff - prev_offset;
+    if (applied) {
+        replicationFeedSlavesFromMasterStream(server.slaves,
+                                              c->pending_querybuf, applied);
+        sdsrange(c->pending_querybuf,applied,-1);
+    }
+}
+
 void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     client *c = (client*) privdata;
     int nread, readlen;
@@ -1385,6 +3016,7 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
     } else if (nread == 0) {
         serverLog(LL_VERBOSE, "Client closed connection");
+        serverLog(LL_DEBUG, "Client fd: %d closed connection.", c->fd);
         freeClient(c);
         return;
     } else if (c->flags & CLIENT_MASTER) {
@@ -1419,14 +3051,7 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     if (!(c->flags & CLIENT_MASTER)) {
         processInputBuffer(c);
     } else {
-        size_t prev_offset = c->reploff;
-        processInputBuffer(c);
-        size_t applied = c->reploff - prev_offset;
-        if (applied) {
-            replicationFeedSlavesFromMasterStream(server.slaves,
-                    c->pending_querybuf, applied);
-            sdsrange(c->pending_querybuf,applied,-1);
-        }
+        processInputBufferOfMaster(c);
     }
 }
 

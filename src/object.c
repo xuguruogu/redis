@@ -48,7 +48,9 @@ robj *createObject(int type, void *ptr) {
     /* Set the LRU to the current lruclock (minutes resolution), or
      * alternatively the LFU counter. */
     if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
-        o->lru = (LFUGetTimeInMinutes()<<8) | LFU_INIT_VAL;
+        if (!server.swap_mode) {
+            o->lru = (LFUGetTimeInMinutes()<<8) | LFU_INIT_VAL;
+        }
     } else {
         o->lru = LRU_CLOCK();
     }
@@ -90,7 +92,9 @@ robj *createEmbeddedStringObject(const char *ptr, size_t len) {
     o->ptr = sh+1;
     o->refcount = 1;
     if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
-        o->lru = (LFUGetTimeInMinutes()<<8) | LFU_INIT_VAL;
+        if (!server.swap_mode) {
+            o->lru = (LFUGetTimeInMinutes() << 8) | LFU_INIT_VAL;
+        }
     } else {
         o->lru = LRU_CLOCK();
     }
@@ -402,7 +406,11 @@ robj *tryObjectEncoding(robj *o) {
          * Note that we avoid using shared integers when maxmemory is used
          * because every object needs to have a private LRU field for the LRU
          * algorithm to work well. */
-        if ((server.maxmemory == 0 ||
+
+        /* in swapdb mode, lfu info is stored in the header of sds key, we
+         * don't need to use the LRU field in value object, so we can always
+         * use shared integers.*/
+        if ((server.maxmemory == 0 || server.swap_mode ||
             !(server.maxmemory_policy & MAXMEMORY_FLAG_NO_SHARED_INTEGERS)) &&
             value >= 0 &&
             value < OBJ_SHARED_INTEGERS)
@@ -1029,13 +1037,29 @@ void objectCommand(client *c) {
         }
         addReplyLongLong(c,estimateObjectIdleTime(o)/1000);
     } else if (!strcasecmp(c->argv[1]->ptr,"freq") && c->argc == 3) {
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
+        dictEntry *de, *ev_de;
+        sds db_key;
+        long long counter;
+        unsigned int lfu;
+        if (server.swap_mode) {
+            if (((de = dictFind(c->db->dict,c->argv[2]->ptr)) == NULL) &&
+                        ((ev_de = dictFind(EVICTED_DATA_DB->dict, c->argv[2]->ptr)) == NULL)) {
+                addReply(c, shared.nullbulk);
+                return;
+            }
+            db_key = de ? dictGetKey(de) : dictGetKey(ev_de);
+            lfu = sdsgetlfu(db_key);
+            counter = lfu & 255;
+        } else {
+            if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
                 == NULL) return;
+            counter = o->lru & 255;
+        }
         if (server.maxmemory_policy & MAXMEMORY_FLAG_LRU) {
             addReplyError(c,"An LRU maxmemory policy is selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.");
             return;
         }
-        addReplyLongLong(c,o->lru&255);
+        addReplyLongLong(c,counter);
     } else {
         addReplyError(c,"Syntax error. Try OBJECT (refcount|encoding|idletime|freq)");
     }

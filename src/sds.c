@@ -39,34 +39,99 @@
 #include "sds.h"
 #include "sdsalloc.h"
 
-static inline int sdsHdrSize(char type) {
-    switch(type&SDS_TYPE_MASK) {
-        case SDS_TYPE_5:
-            return sizeof(struct sdshdr5);
-        case SDS_TYPE_8:
-            return sizeof(struct sdshdr8);
-        case SDS_TYPE_16:
-            return sizeof(struct sdshdr16);
-        case SDS_TYPE_32:
-            return sizeof(struct sdshdr32);
-        case SDS_TYPE_64:
-            return sizeof(struct sdshdr64);
-    }
-    return 0;
-}
-
-static inline char sdsReqType(size_t string_size) {
-    if (string_size < 1<<5)
-        return SDS_TYPE_5;
+static inline char sdsReqType(size_t string_size, int is_lfu_type) {
+    if (string_size < 1<<4)
+        return is_lfu_type ? SDS_TYPE_5_LFU : SDS_TYPE_5;
     if (string_size < 1<<8)
-        return SDS_TYPE_8;
+        return is_lfu_type ? SDS_TYPE_8_LFU : SDS_TYPE_8;
     if (string_size < 1<<16)
-        return SDS_TYPE_16;
+        return is_lfu_type ? SDS_TYPE_16_LFU : SDS_TYPE_16;
 #if (LONG_MAX == LLONG_MAX)
     if (string_size < 1ll<<32)
-        return SDS_TYPE_32;
+        return is_lfu_type ? SDS_TYPE_32_LFU : SDS_TYPE_32;
 #endif
-    return SDS_TYPE_64;
+    return is_lfu_type ? SDS_TYPE_64_LFU : SDS_TYPE_64;
+}
+
+void sdssetlfu(sds s, unsigned int lfu) {
+    unsigned char counter = lfu & 255;
+    unsigned short lfu_decr_time = lfu >> 8;
+    char type = s[-1] & SDS_TYPE_MASK;
+    switch(type) {
+        case SDS_TYPE_5_LFU: {
+            SDS_HDR_VAR(5lfu,s);
+            sh->lfu_decr_time = lfu_decr_time;
+            sh->lfu_counter = counter;
+            break;
+        }
+        case SDS_TYPE_8_LFU: {
+            SDS_HDR_VAR(8lfu,s);
+            sh->lfu_decr_time = lfu_decr_time;
+            sh->lfu_counter = counter;
+            break;
+        }
+        case SDS_TYPE_16_LFU: {
+            SDS_HDR_VAR(16lfu,s);
+            sh->lfu_decr_time = lfu_decr_time;
+            sh->lfu_counter = counter;
+            break;
+        }
+        case SDS_TYPE_32_LFU: {
+            SDS_HDR_VAR(32lfu,s);
+            sh->lfu_decr_time = lfu_decr_time;
+            sh->lfu_counter = counter;
+            break;
+        }
+        case SDS_TYPE_64_LFU: {
+            SDS_HDR_VAR(64lfu,s);
+            sh->lfu_decr_time = lfu_decr_time;
+            sh->lfu_counter = counter;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+unsigned int sdsgetlfu(sds s) {
+    char type = s[-1] & SDS_TYPE_MASK;
+    switch(type&SDS_TYPE_MASK) {
+         case SDS_TYPE_5_LFU: {
+            SDS_HDR_VAR(5lfu,s);
+            return ((sh->lfu_decr_time << 8) | sh->lfu_counter);
+        }
+        case SDS_TYPE_8_LFU: {
+            SDS_HDR_VAR(8lfu,s);
+            return ((sh->lfu_decr_time << 8) | sh->lfu_counter);
+        }
+        case SDS_TYPE_16_LFU: {
+            SDS_HDR_VAR(16lfu,s);
+            return ((sh->lfu_decr_time << 8) | sh->lfu_counter);
+        }
+        case SDS_TYPE_32_LFU: {
+            SDS_HDR_VAR(32lfu,s);
+            return ((sh->lfu_decr_time << 8) | sh->lfu_counter);
+        }
+        case SDS_TYPE_64_LFU: {
+            SDS_HDR_VAR(64lfu,s);
+            return ((sh->lfu_decr_time << 8) | sh->lfu_counter);
+        }
+        default:
+            return 0;
+    }
+}
+
+int sdscopylfu(sds dest, sds src) {
+    char dest_type = dest[-1] & SDS_TYPE_MASK;
+    char src_type = src[-1] & SDS_TYPE_MASK;
+
+    if ((dest_type & SDS_TYPE_LFU) && (src_type & SDS_TYPE_LFU)) {
+        unsigned int lfu = sdsgetlfu(src);
+        sdssetlfu(dest, lfu);
+        return 0;
+    } else {
+        return -1;
+    }
 }
 
 /* Create a new sds string with the content specified by the 'init' pointer
@@ -81,13 +146,15 @@ static inline char sdsReqType(size_t string_size) {
  * You can print the string with printf() as there is an implicit \0 at the
  * end of the string. However the string is binary safe and can contain
  * \0 characters in the middle, as the length is stored in the sds header. */
-sds sdsnewlen(const void *init, size_t initlen) {
+
+sds sdsnewlen2(const void *init, size_t initlen, int is_lfu_type) {
     void *sh;
     sds s;
-    char type = sdsReqType(initlen);
+    char type = sdsReqType(initlen, is_lfu_type);
     /* Empty strings are usually created in order to append. Use type 8
      * since type 5 is not good at this. */
     if (type == SDS_TYPE_5 && initlen == 0) type = SDS_TYPE_8;
+    if (type == SDS_TYPE_5_LFU && initlen == 0) type = SDS_TYPE_8_LFU;
     int hdrlen = sdsHdrSize(type);
     unsigned char *fp; /* flags pointer. */
 
@@ -98,12 +165,20 @@ sds sdsnewlen(const void *init, size_t initlen) {
     s = (char*)sh+hdrlen;
     fp = ((unsigned char*)s)-1;
     switch(type) {
-        case SDS_TYPE_5: {
+        case SDS_TYPE_5:
+        case SDS_TYPE_5_LFU: {
             *fp = type | (initlen << SDS_TYPE_BITS);
             break;
         }
         case SDS_TYPE_8: {
             SDS_HDR_VAR(8,s);
+            sh->len = initlen;
+            sh->alloc = initlen;
+            *fp = type;
+            break;
+        }
+        case SDS_TYPE_8_LFU: {
+            SDS_HDR_VAR(8lfu,s);
             sh->len = initlen;
             sh->alloc = initlen;
             *fp = type;
@@ -116,8 +191,22 @@ sds sdsnewlen(const void *init, size_t initlen) {
             *fp = type;
             break;
         }
+        case SDS_TYPE_16_LFU: {
+            SDS_HDR_VAR(16lfu,s);
+            sh->len = initlen;
+            sh->alloc = initlen;
+            *fp = type;
+            break;
+        }
         case SDS_TYPE_32: {
             SDS_HDR_VAR(32,s);
+            sh->len = initlen;
+            sh->alloc = initlen;
+            *fp = type;
+            break;
+        }
+        case SDS_TYPE_32_LFU: {
+            SDS_HDR_VAR(32lfu,s);
             sh->len = initlen;
             sh->alloc = initlen;
             *fp = type;
@@ -130,11 +219,27 @@ sds sdsnewlen(const void *init, size_t initlen) {
             *fp = type;
             break;
         }
+        case SDS_TYPE_64_LFU: {
+            SDS_HDR_VAR(64lfu,s);
+            sh->len = initlen;
+            sh->alloc = initlen;
+            *fp = type;
+            break;
+        }
     }
     if (initlen && init)
         memcpy(s, init, initlen);
     s[initlen] = '\0';
     return s;
+}
+
+sds sdsnewlen(const void *init, size_t initlen) {
+#ifdef SDS_TEST_MAIN
+    printf("\nuse lfu type!!!!!!\n");
+    return sdsnewlen2(init, initlen, 1);
+#else
+    return sdsnewlen2(init, initlen, 0);
+#endif
 }
 
 /* Create an empty (zero length) sds string. Even in this case the string
@@ -146,7 +251,12 @@ sds sdsempty(void) {
 /* Create a new sds string starting from a null terminated C string. */
 sds sdsnew(const char *init) {
     size_t initlen = (init == NULL) ? 0 : strlen(init);
+#ifdef SDS_TEST_MAIN
+    printf("\nuse lfu type!!!!!!\n");
+    return sdsnewlen2(init, initlen, 1);
+#else
     return sdsnewlen(init, initlen);
+#endif
 }
 
 /* Duplicate an sds string. */
@@ -200,6 +310,7 @@ sds sdsMakeRoomFor(sds s, size_t addlen) {
     size_t len, newlen;
     char type, oldtype = s[-1] & SDS_TYPE_MASK;
     int hdrlen;
+    int is_lfu_type = 0;
 
     /* Return ASAP if there is enough space left. */
     if (avail >= addlen) return s;
@@ -212,12 +323,15 @@ sds sdsMakeRoomFor(sds s, size_t addlen) {
     else
         newlen += SDS_MAX_PREALLOC;
 
-    type = sdsReqType(newlen);
+    if (oldtype & SDS_TYPE_LFU) is_lfu_type = 1;
+
+    type = sdsReqType(newlen, is_lfu_type);
 
     /* Don't use type 5: the user is appending to the string and type 5 is
      * not able to remember empty space, so sdsMakeRoomFor() must be called
      * at every appending operation. */
     if (type == SDS_TYPE_5) type = SDS_TYPE_8;
+    if (type == SDS_TYPE_5_LFU) type = SDS_TYPE_8_LFU;
 
     hdrlen = sdsHdrSize(type);
     if (oldtype==type) {
@@ -248,11 +362,12 @@ sds sdsMakeRoomFor(sds s, size_t addlen) {
 sds sdsRemoveFreeSpace(sds s) {
     void *sh, *newsh;
     char type, oldtype = s[-1] & SDS_TYPE_MASK;
-    int hdrlen;
+    int hdrlen, is_lfu_type = 0;
     size_t len = sdslen(s);
     sh = (char*)s-sdsHdrSize(oldtype);
 
-    type = sdsReqType(len);
+    if (oldtype & SDS_TYPE_LFU) is_lfu_type = 1;
+    type = sdsReqType(len, is_lfu_type);
     hdrlen = sdsHdrSize(type);
     if (oldtype==type) {
         newsh = s_realloc(sh, hdrlen+len+1);
@@ -319,13 +434,31 @@ void sdsIncrLen(sds s, int incr) {
         case SDS_TYPE_5: {
             unsigned char *fp = ((unsigned char*)s)-1;
             unsigned char oldlen = SDS_TYPE_5_LEN(flags);
-            assert((incr > 0 && oldlen+incr < 32) || (incr < 0 && oldlen >= (unsigned int)(-incr)));
+            /* The max length is 15 for SDS_TYPE_5 in swap_mode,
+             * max value is 31 for SDS_TYPE_5 in native redis.*/
+            assert((incr > 0 && oldlen+incr < 16) || (incr < 0 && oldlen >= (unsigned int)(-incr)));
             *fp = SDS_TYPE_5 | ((oldlen+incr) << SDS_TYPE_BITS);
+            len = oldlen+incr;
+            break;
+        }
+        case SDS_TYPE_5_LFU: {
+            unsigned char *fp = ((unsigned char*)s)-1;
+            unsigned char oldlen = SDS_TYPE_5_LFU_LEN(flags);
+            /* The max length is 15 for SDS_TYPE_5 in swap_mode,
+             * max value is 31 for SDS_TYPE_5 in native redis.*/
+            assert((incr > 0 && oldlen+incr < 16) || (incr < 0 && oldlen >= (unsigned int)(-incr)));
+            *fp = SDS_TYPE_5_LFU | ((oldlen+incr) << SDS_TYPE_BITS);
             len = oldlen+incr;
             break;
         }
         case SDS_TYPE_8: {
             SDS_HDR_VAR(8,s);
+            assert((incr >= 0 && sh->alloc-sh->len >= incr) || (incr < 0 && sh->len >= (unsigned int)(-incr)));
+            len = (sh->len += incr);
+            break;
+        }
+        case SDS_TYPE_8_LFU: {
+            SDS_HDR_VAR(8lfu,s);
             assert((incr >= 0 && sh->alloc-sh->len >= incr) || (incr < 0 && sh->len >= (unsigned int)(-incr)));
             len = (sh->len += incr);
             break;
@@ -336,14 +469,32 @@ void sdsIncrLen(sds s, int incr) {
             len = (sh->len += incr);
             break;
         }
+        case SDS_TYPE_16_LFU: {
+            SDS_HDR_VAR(16lfu,s);
+            assert((incr >= 0 && sh->alloc-sh->len >= incr) || (incr < 0 && sh->len >= (unsigned int)(-incr)));
+            len = (sh->len += incr);
+            break;
+        }
         case SDS_TYPE_32: {
             SDS_HDR_VAR(32,s);
             assert((incr >= 0 && sh->alloc-sh->len >= (unsigned int)incr) || (incr < 0 && sh->len >= (unsigned int)(-incr)));
             len = (sh->len += incr);
             break;
         }
+        case SDS_TYPE_32_LFU: {
+            SDS_HDR_VAR(32lfu,s);
+            assert((incr >= 0 && sh->alloc-sh->len >= (unsigned int)incr) || (incr < 0 && sh->len >= (unsigned int)(-incr)));
+            len = (sh->len += incr);
+            break;
+        }
         case SDS_TYPE_64: {
             SDS_HDR_VAR(64,s);
+            assert((incr >= 0 && sh->alloc-sh->len >= (uint64_t)incr) || (incr < 0 && sh->len >= (uint64_t)(-incr)));
+            len = (sh->len += incr);
+            break;
+        }
+        case SDS_TYPE_64_LFU: {
+            SDS_HDR_VAR(64lfu,s);
             assert((incr >= 0 && sh->alloc-sh->len >= (uint64_t)incr) || (incr < 0 && sh->len >= (uint64_t)(-incr)));
             len = (sh->len += incr);
             break;
@@ -1153,6 +1304,18 @@ int sdsTest(void) {
             memcmp(x,"--4294967295,18446744073709551615--",35) == 0)
 
         sdsfree(x);
+        x = sdsnew("=");
+        test_cond("", (x[-1] & SDS_TYPE_MASK) == 8)
+
+        sdsfree(x);
+        x = sdsnew("123456789abcdef");
+        test_cond("sds init len is 15, type is SDS_TYPE_5", (x[-1] & SDS_TYPE_MASK) == 8)
+
+        sdsfree(x);
+        x = sdsnew("123456789abcdefg");
+        test_cond("sds init len is 16, type is SDS_TYPE_8", (x[-1] & SDS_TYPE_MASK) == 9)
+
+        sdsfree(x);
         x = sdsnew(" x ");
         sdstrim(x," x");
         test_cond("sdstrim() works when all chars match",
@@ -1271,6 +1434,8 @@ int sdsTest(void) {
 #endif
 
 #ifdef SDS_TEST_MAIN
+// make test-sds -e USE_JEMALLOC=no
+
 int main(void) {
     return sdsTest();
 }

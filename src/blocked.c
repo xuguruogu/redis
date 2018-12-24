@@ -122,9 +122,41 @@ void processUnblockedClients(void) {
          * client is not blocked before to proceed, but things may change and
          * the code is conceptually more correct this way. */
         if (!(c->flags & CLIENT_BLOCKED)) {
-            if (c->querybuf && sdslen(c->querybuf) > 0) {
+            if (server.swap_mode && c->flags & CLIENT_MASTER
+                && c->querybuf && sdslen(c->querybuf) > 0) {
+                processInputBufferOfMaster(c);
+            } else if (c->querybuf && sdslen(c->querybuf) > 0)
                 processInputBuffer(c);
-            }
+        }
+    }
+}
+
+/* remove this client from server.ssdb_flushall_blocked_clients to avoid
+* it processed by handleClientsBlockedOnFlushall again.*/
+void removeClientWaitingSSDBflushall(client* c) {
+    listNode* ln = listSearchKey(server.ssdb_flushall_blocked_clients, c);
+    if (ln) listDelNode(server.ssdb_flushall_blocked_clients, ln);
+}
+
+/* remove this client from server.no_writing_ssdb_blocked_clients to avoid
+* it processed by handleClientsBlockedOnCustomizedPsync again.*/
+void removeClientWaitingSSDBcheckWrite(client* c) {
+    listNode* ln = listSearchKey(server.no_writing_ssdb_blocked_clients, c);
+    if (ln) listDelNode(server.no_writing_ssdb_blocked_clients, ln);
+}
+
+/* Unblock the first client in the blocked client list of writing on the same key. */
+void unblockClientWritingOnSameKey(robj* keyobj) {
+    if (dictFind(server.db[0].blocking_keys_write_same_ssdbkey, keyobj) &&
+        0 == isThisKeyVisitingWriteSSDB(keyobj->ptr)) {
+        client *blocked = removeFirstClientFromListForBlockedKey(server.db[0].blocking_keys_write_same_ssdbkey, keyobj);
+        serverAssert(blocked->btype == BLOCKED_WRITE_SAME_SSDB_KEY);
+        unblockClient(blocked);
+        serverLog(LL_DEBUG, "client fd:%d, cmd: %s, key: %s is unblocked",
+                  blocked->fd, blocked->cmd->name, (char*)keyobj->ptr);
+        if (tryBlockingClient(blocked) == C_OK) {
+            if (C_OK == runCommand(blocked))
+                resetClient(blocked);
         }
     }
 }
@@ -138,6 +170,44 @@ void unblockClient(client *c) {
         unblockClientWaitingReplicas(c);
     } else if (c->btype == BLOCKED_MODULE) {
         unblockClientFromModule(c);
+    } else if (server.swap_mode && c->btype == BLOCKED_BY_FLUSHALL) {
+        if (server.masterhost == NULL) {
+            server.prohibit_ssdb_read_write = NO_PROHIBIT_SSDB_READ_WRITE;
+            server.is_doing_flushall = 0;
+            server.current_flushall_client = NULL;
+        }
+    } else if (server.swap_mode
+               && (c->btype == BLOCKED_SSDB_LOADING_OR_TRANSFER
+                   || c->btype == BLOCKED_NO_READ_WRITE_TO_SSDB
+                   || c->btype == BLOCKED_NO_WRITE_TO_SSDB
+                   || c->btype == BLOCKED_WRITE_SAME_SSDB_KEY
+                   || c->btype == BLOCKED_BY_DELETE_CONFIRM
+                   || c->btype == BLOCKED_BY_EXPIRED_DELETE
+                   || c->btype == BLOCKED_MIGRATING_CLIENT)) {
+        /* Doing nothing. */
+    } else if (server.swap_mode && c->btype == BLOCKED_VISITING_SSDB) {
+        if (server.masterhost == NULL) {
+            removeVisitingSSDBKey(c->cmd, c->argc, c->argv);
+            if (c->cmd->flags & CMD_WRITE) {
+                if (c->first_key_index != 0) {
+                    robj* keyobj = c->argv[c->first_key_index];
+                    unblockClientWritingOnSameKey(keyobj);
+                }
+            }
+        }
+    } else if (server.swap_mode && c->btype == BLOCKED_MIGRATING_DUMP) {
+        /* Migrate will translated to del after migrateCommand(). */
+        serverAssert(c->cmd->proc == migrateCommand
+                     || c->cmd->proc == delCommand);
+        if (c->cmd->proc == migrateCommand) {
+            serverAssert(c->argv && c->argc > 0 && c->argv[3]);
+            delMigratingSSDBKey(c->argv[3]->ptr);
+        }
+
+        if (c->cmd->proc == delCommand) {
+            serverAssert(c->argv && c->argc > 0 && c->argv[1]);
+            delMigratingSSDBKey(c->argv[1]->ptr);
+        }
     } else {
         serverPanic("Unknown btype in unblockClient().");
     }
@@ -157,16 +227,50 @@ void unblockClient(client *c) {
 /* This function gets called when a blocked client timed out in order to
  * send it a reply of some kind. After this function is called,
  * unblockClient() will be called with the same client as argument. */
-void replyToBlockedClientTimedOut(client *c) {
+int replyToBlockedClientTimedOut(client *c) {
     if (c->btype == BLOCKED_LIST) {
         addReply(c,shared.nullmultibulk);
     } else if (c->btype == BLOCKED_WAIT) {
         addReplyLongLong(c,replicationCountAcksByOffset(c->bpop.reploffset));
     } else if (c->btype == BLOCKED_MODULE) {
         moduleBlockedClientTimedOut(c);
+    } else if (server.swap_mode && c->btype == BLOCKED_SSDB_LOADING_OR_TRANSFER) {
+        transferringOrLoadingBlockedClientTimeOut(c);
+        return C_ERR;
+    } else if (server.swap_mode
+               && (c->btype == BLOCKED_VISITING_SSDB
+                   || c->btype == BLOCKED_BY_FLUSHALL
+                   || c->btype == BLOCKED_BY_DELETE_CONFIRM
+                   || c->btype == BLOCKED_BY_EXPIRED_DELETE
+                   || c->btype == BLOCKED_MIGRATING_CLIENT
+                   || c->btype == BLOCKED_MIGRATING_DUMP)) {
+        serverLog(LL_DEBUG, "[!!!!]block timeout(client:%p,fd:%d,btype:%d), will free client",
+                  (void*)c, c->fd, c->btype);
+        /* must unblock for BLOCKED_VISITING_SSDB and BLOCKED_MIGRATING_DUMP types. */
+        unblockClient(c);
+        addReplyError(c, "timeout");
+        /* free client to avoid unexpected issues.*/
+        freeClient(c);
+        return C_ERR;
+    } else if (server.swap_mode && (c->btype == BLOCKED_WRITE_SAME_SSDB_KEY ||
+                                    c->btype == BLOCKED_NO_READ_WRITE_TO_SSDB ||
+                                    c->btype == BLOCKED_NO_WRITE_TO_SSDB)) {
+        serverLog(LL_DEBUG, "[!!!!]block timeout(client:%p,fd:%d,btype:%d), reset it", (void*)c, c->fd, c->btype);
+        if (c->btype == BLOCKED_WRITE_SAME_SSDB_KEY)
+            removeClientFromListForBlockedKey(c, server.db[0].blocking_keys_write_same_ssdbkey, c->argv[1]);
+        else if (c->btype == BLOCKED_NO_READ_WRITE_TO_SSDB)
+            removeClientWaitingSSDBflushall(c);
+        else if (c->btype == BLOCKED_NO_WRITE_TO_SSDB)
+            removeClientWaitingSSDBcheckWrite(c);
+
+        unblockClient(c);
+        addReplyError(c, "timeout");
+        resetClient(c);
+        return C_ERR;
     } else {
         serverPanic("Unknown btype in replyToBlockedClientTimedOut().");
     }
+    return C_OK;
 }
 
 /* Mass-unblock clients because something changed in the instance that makes

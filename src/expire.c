@@ -57,6 +57,10 @@ int activeExpireCycleTryExpire(redisDb *db, dictEntry *de, long long now) {
         sds key = dictGetKey(de);
         robj *keyobj = createStringObject(key,sdslen(key));
 
+        if (server.swap_mode && 0 == checkBeforeExpire(db, keyobj)) {
+            decrRefCount(keyobj);
+            return 0;
+        }
         propagateExpire(db,keyobj,server.lazyfree_lazy_expire);
         if (server.lazyfree_lazy_expire)
             dbAsyncDelete(db,keyobj);
@@ -104,6 +108,10 @@ void activeExpireCycle(int type) {
     int j, iteration = 0;
     int dbs_per_call = CRON_DBS_PER_CALL;
     long long start = ustime(), timelimit;
+
+    /* Try to expire the EVICTED_DATA_DB. */
+    if (server.swap_mode)
+        dbs_per_call += 1;
 
     /* When clients are paused the dataset should be static not just from the
      * POV of clients not being able to write, but also from the POV of
@@ -404,6 +412,11 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
      * (possibly in the past) and wait for an explicit DEL from the master. */
     if (when <= mstime() && !server.loading && !server.masterhost) {
         robj *aux;
+        if (server.swap_mode && NULL == server.masterhost && c->db->id == EVICTED_DATA_DBID) {
+            /* add this expired key to dict, we will tell ssdb to
+             * delete it. */
+            dictAddOrFind(c->db->ssdb_keys_to_clean, key->ptr);
+        }
 
         int deleted = server.lazyfree_lazy_expire ? dbAsyncDelete(c->db,key) :
                                                     dbSyncDelete(c->db,key);
@@ -427,38 +440,54 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
     }
 }
 
+void expireCustomizedCommand(client *c, long long basetime, int unit) {
+    redisDb *db = c->db;
+    if (server.swap_mode && lookupKey(EVICTED_DATA_DB, c->argv[1], LOOKUP_NOTOUCH)) {
+        c->db = EVICTED_DATA_DB;
+        expireGenericCommand(c, basetime, unit);
+        c->db = db;
+    } else {
+        expireGenericCommand(c, basetime, unit);
+    }
+}
+
 /* EXPIRE key seconds */
 void expireCommand(client *c) {
-    expireGenericCommand(c,mstime(),UNIT_SECONDS);
+    expireCustomizedCommand(c,mstime(),UNIT_SECONDS);
 }
 
 /* EXPIREAT key time */
 void expireatCommand(client *c) {
-    expireGenericCommand(c,0,UNIT_SECONDS);
+    expireCustomizedCommand(c,0,UNIT_SECONDS);
 }
 
 /* PEXPIRE key milliseconds */
 void pexpireCommand(client *c) {
-    expireGenericCommand(c,mstime(),UNIT_MILLISECONDS);
+    expireCustomizedCommand(c,mstime(),UNIT_MILLISECONDS);
 }
 
 /* PEXPIREAT key ms_time */
 void pexpireatCommand(client *c) {
-    expireGenericCommand(c,0,UNIT_MILLISECONDS);
+    expireCustomizedCommand(c,0,UNIT_MILLISECONDS);
 }
 
 /* Implements TTL and PTTL */
 void ttlGenericCommand(client *c, int output_ms) {
     long long expire, ttl = -1;
+    redisDb *db;
 
-    /* If the key does not exist at all, return -2 */
-    if (lookupKeyReadWithFlags(c->db,c->argv[1],LOOKUP_NOTOUCH) == NULL) {
+    db = c->db;
+    if (server.swap_mode
+        && (lookupKeyReadWithFlags(EVICTED_DATA_DB,c->argv[1],LOOKUP_NOTOUCH) != NULL))
+        db = EVICTED_DATA_DB;
+    else if (lookupKeyReadWithFlags(db,c->argv[1],LOOKUP_NOTOUCH) == NULL) {
+        /* If the key does not exist at all, return -2 */
         addReplyLongLong(c,-2);
         return;
     }
     /* The key exists. Return -1 if it has no expire, or the actual
      * TTL value otherwise. */
-    expire = getExpire(c->db,c->argv[1]);
+    expire = getExpire(db,c->argv[1]);
     if (expire != -1) {
         ttl = expire-mstime();
         if (ttl < 0) ttl = 0;

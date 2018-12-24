@@ -165,6 +165,16 @@ void feedReplicationBacklogWithObject(robj *o) {
     feedReplicationBacklog(p,len);
 }
 
+void enableSlaveToPropagate(client *slave) {
+    if (server.swap_mode && slave->replstate == SLAVE_STATE_SEND_BULK_FINISHED)
+        slave->flags |= CLIENT_SLAVE_FORCE_PROPAGATE;
+}
+
+void disableSlaveToPropagate(client *slave) {
+    if (server.swap_mode && slave->replstate == SLAVE_STATE_SEND_BULK_FINISHED)
+        slave->flags &= ~CLIENT_SLAVE_FORCE_PROPAGATE;
+}
+
 /* Propagate write commands to slaves, and populate the replication backlog
  * as well. This function is used if the instance is a master: we use
  * the commands received by our clients in order to create the replication
@@ -189,6 +199,12 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
 
     /* We can't have slaves attached and no backlog. */
     serverAssert(!(listLength(slaves) != 0 && server.repl_backlog == NULL));
+
+    /* in swap mode, we only use dbid 0 to propagate command to slaves. to
+     * avoid some issues because of inconsistent hot/cold keys. */
+    if (server.swap_mode) {
+        dictid = 0;
+    }
 
     /* Send SELECT command to every slave if needed. */
     if (server.slaveseldb != dictid) {
@@ -215,12 +231,18 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
         while((ln = listNext(&li))) {
             client *slave = ln->value;
             if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) continue;
+            enableSlaveToPropagate(slave);
             addReply(slave,selectcmd);
+            disableSlaveToPropagate(slave);
         }
 
         if (dictid < 0 || dictid >= PROTO_SHARED_SELECT_CMDS)
             decrRefCount(selectcmd);
+
+        serverLog(LL_DEBUG, "dbid changed from %d to %d. propagate select db command to slaves.",
+                  server.slaveseldb, dictid);
     }
+    serverLog(LL_DEBUG, "propagate command(%s) to slaves", (sds)argv[0]->ptr);
     server.slaveseldb = dictid;
 
     /* Write the command to the replication backlog if any. */
@@ -258,6 +280,8 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
         /* Don't feed slaves that are still waiting for BGSAVE to start */
         if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) continue;
 
+        enableSlaveToPropagate(slave);
+
         /* Feed slaves that are waiting for the initial SYNC (so these commands
          * are queued in the output buffer until the initial SYNC completes),
          * or are already in sync with the master. */
@@ -269,6 +293,8 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
          * static buffer if any (from j to argc). */
         for (j = 0; j < argc; j++)
             addReplyBulk(slave,argv[j]);
+
+        disableSlaveToPropagate(slave);
     }
 }
 
@@ -429,8 +455,12 @@ int replicationSetupSlaveForFullResync(client *slave, long long offset) {
     /* Don't send this reply to slaves that approached us with
      * the old SYNC command. */
     if (!(slave->flags & CLIENT_PRE_PSYNC)) {
-        buflen = snprintf(buf,sizeof(buf),"+FULLRESYNC %s %lld\r\n",
-                          server.replid,offset);
+        if (server.swap_mode)
+            buflen = snprintf(buf,sizeof(buf),"+FULLRESYNC %s %lld %lld\r\n",
+                              server.replid,offset, server.ssdb_snapshot_timestamp);
+        else
+            buflen = snprintf(buf,sizeof(buf),"+FULLRESYNC %s %lld\r\n",
+                              server.replid,offset);
         if (write(slave->fd,buf,buflen) != buflen) {
             freeClientAsync(slave);
             return C_ERR;
@@ -600,6 +630,9 @@ int startBgsaveForReplication(int mincapa) {
                 slave->flags |= CLIENT_CLOSE_AFTER_REPLY;
             }
         }
+        if (server.swap_mode && server.use_customized_replication) {
+            server.ssdb_status = SSDB_NONE;
+        }
         return retval;
     }
 
@@ -623,10 +656,75 @@ int startBgsaveForReplication(int mincapa) {
     return retval;
 }
 
+void prepareSSDBreplication(client* slave) {
+    listIter li;
+    listNode *ln;
+    client *c;
+
+    serverAssert( (server.ssdb_status == SSDB_NONE && slave->ssdb_status == SSDB_NONE) ||
+                  (server.ssdb_status == MASTER_SSDB_SNAPSHOT_WAIT_FLUSHALL
+                   && slave->ssdb_status == SLAVE_SSDB_SNAPSHOT_WAIT_FLUSHALL));
+
+    if (server.masterhost && listLength(server.ssdb_write_oplist) > 0) {
+        serverLog(LL_NOTICE, "we have unprocessed write operations for replication connection(server.master),"
+                " disconnect and retry later");
+        freeClient(slave);
+        return;
+    }
+
+    /* NOTE: discard transferring/loading keys and disconnect server.ssdb_client to make
+     * sure consistency between master and slave.*/
+    if (server.ssdb_client) freeClient(server.ssdb_client);
+    if (server.slave_ssdb_load_evict_client) freeClient(server.slave_ssdb_load_evict_client);
+
+    slave->ssdb_status = SLAVE_SSDB_SNAPSHOT_IN_PROCESS;
+
+    /* Update the server's status. */
+    server.ssdb_status = MASTER_SSDB_SNAPSHOT_CHECK_WRITE;
+
+    server.check_write_begin_time = server.unixtime;
+
+    /* Forbbid sending the writing cmds to SSDB. */
+    server.is_allow_ssdb_write = DISALLOW_SSDB_WRITE;
+    /* reset to 0 */
+    server.check_write_unresponse_num = 0;
+    /* Force all the clients to check the write cmd. */
+    listRewind(server.clients, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        c = listNodeValue(ln);
+
+        if (c->flags & CLIENT_SLAVE) continue;
+
+        /* if this server is a slave, and we receive 'sync' request,
+         * avoid to send write check to the replication connection(server.master) */
+        if (c->flags & CLIENT_MASTER) continue;
+
+        if (aeCreateFileEvent(server.el, c->fd, AE_WRITABLE,
+                              sendCheckWriteCommandToSSDB, c) == AE_ERR) {
+            /* just free disconnected client and ignore it. */
+            freeClient(c);
+        } else {
+            c->ssdb_conn_flags |= CONN_WAIT_WRITE_CHECK_REPLY;
+            server.check_write_unresponse_num++;
+        }
+    }
+
+    if (0 == server.check_write_unresponse_num) {
+        makeSSDBsnapshotIfCheckOK();
+    }
+}
+
 /* SYNC and PSYNC command implemenation. */
 void syncCommand(client *c) {
     /* ignore SYNC if already slave or in monitor mode */
     if (c->flags & CLIENT_SLAVE) return;
+
+    if (server.masterhost && server.swap_mode) {
+        addReplyError(c, "don't support psync/sync for slave server in swap mode");
+        serverLog(LL_DEBUG, "don't support psync/sync for slave server in swap mode");
+        freeClientAsync(c);
+        return;
+    }
 
     /* Refuse SYNC requests if we are a slave but the link with our master
      * is not ok... */
@@ -698,7 +796,62 @@ void syncCommand(client *c) {
         createReplicationBacklog();
     }
 
-    /* CASE 1: BGSAVE is in progress, with disk target. */
+    if (server.swap_mode && server.use_customized_replication) {
+        if (server.ssdb_status > SSDB_NONE) {
+            /* at least one slave is doing replication.*/
+            client *slave;
+            listNode *ln;
+            listIter li;
+
+            int max_replstate = SLAVE_STATE_WAIT_BGSAVE_START;
+            listRewind(server.slaves,&li);
+            while((ln = listNext(&li))) {
+                slave = ln->value;
+                /* skip online slave. */
+                if (slave->replstate != SLAVE_STATE_ONLINE && slave->replstate > max_replstate)
+                    max_replstate = slave->replstate;
+            }
+
+            if (max_replstate < SLAVE_STATE_WAIT_BGSAVE_END) {
+                /* wait for another slave to make rdb and SSDB snapshot,
+                * we just reuse them later.*/
+                return;
+            } else if (max_replstate == SLAVE_STATE_WAIT_BGSAVE_END &&
+                       server.rdb_child_pid != -1 &&
+                       server.rdb_child_type == RDB_CHILD_TYPE_DISK ) {
+                c->ssdb_status = SLAVE_SSDB_SNAPSHOT_IN_PROCESS;
+
+                /* don't return because we need to copy client output buffer
+                 * and call replicationSetupSlaveForFullResync so c->replstate
+                 * will be SLAVE_STATE_WAIT_BGSAVE_END. */
+            } else {
+                serverAssert(c->ssdb_status == SSDB_NONE);
+                /* RDB file maybe is a new one and we can't reuse it. */
+                serverLog(LL_NOTICE,
+                          "Another replication task is running, and we can't use the same rdb "
+                                  "and SSDB snapshot. BGSAVE for replication delayed");
+                /* Slave will connect Master later. */
+                freeClientAsync(c);
+                return;
+            }
+        } else {
+            serverAssert(server.ssdb_status == SSDB_NONE && c->ssdb_status == SSDB_NONE);
+            if (server.is_doing_flushall) {
+                /* if redis and ssdb are doing flushall/flushdb, delay the replication
+                 * process to avoid deadlock case because of write check. will do this
+                 * later in replicationCron. */
+                server.ssdb_status = MASTER_SSDB_SNAPSHOT_WAIT_FLUSHALL;
+                c->ssdb_status = SLAVE_SSDB_SNAPSHOT_WAIT_FLUSHALL;
+
+                return;
+            }
+
+            prepareSSDBreplication(c);
+            return;
+        }
+    }
+
+   /* CASE 1: BGSAVE is in progress, with disk target. */
     if (server.rdb_child_pid != -1 &&
         server.rdb_child_type == RDB_CHILD_TYPE_DISK)
     {
@@ -739,7 +892,9 @@ void syncCommand(client *c) {
 
     /* CASE 3: There is no BGSAVE is progress. */
     } else {
-        if (server.repl_diskless_sync && (c->slave_capa & SLAVE_CAPA_EOF)) {
+        if (server.swap_mode && server.use_customized_replication) {
+            /* start BGSAVE in replicationCron. do nothing here*/
+        } else if (server.repl_diskless_sync && (c->slave_capa & SLAVE_CAPA_EOF)) {
             /* Diskless replication RDB child is created inside
              * replicationCron() since we want to delay its start a
              * few seconds to wait for more slaves to arrive. */
@@ -856,11 +1011,18 @@ void putSlaveOnline(client *slave) {
     slave->replstate = SLAVE_STATE_ONLINE;
     slave->repl_put_online_on_ack = 0;
     slave->repl_ack_time = server.unixtime; /* Prevent false timeout. */
-    if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE,
-        sendReplyToClient, slave) == AE_ERR) {
-        serverLog(LL_WARNING,"Unable to register writable event for slave bulk transfer: %s", strerror(errno));
-        freeClient(slave);
-        return;
+    if (server.swap_mode) {
+        /* for swap mode, we install write event handler when RDB transfer
+         * is done(may SSDB snapshot transfer is going on), and our slave will
+         * receive increment updates and buffer them in server.ssdb_write_oplist.
+         * avoid to overflow output buffer. */
+    } else {
+        if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE,
+                              sendReplyToClient, slave) == AE_ERR) {
+            serverLog(LL_WARNING,"Unable to register writable event for slave bulk transfer: %s", strerror(errno));
+            freeClient(slave);
+            return;
+        }
     }
     refreshGoodSlavesCount();
     serverLog(LL_NOTICE,"Synchronization with slave %s succeeded",
@@ -919,7 +1081,22 @@ void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         close(slave->repldbfd);
         slave->repldbfd = -1;
         aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
-        putSlaveOnline(slave);
+
+        if (server.swap_mode && server.use_customized_replication) {
+            slave->replstate = SLAVE_STATE_SEND_BULK_FINISHED;
+            serverLog(LL_DEBUG, "Replication log: slave->replstate: SLAVE_STATE_SEND_BULK_FINISHED");
+            /* for swap mode, we install write event handler when RDB transfer
+             * is done(may SSDB snapshot transfer is going on), and our slave will
+             * receive increment updates and buffer them in server.ssdb_write_oplist.
+             * avoid to overflow output buffer. */
+            if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE,
+                                  sendReplyToClient, slave) == AE_ERR) {
+                serverLog(LL_WARNING,"Unable to register writable event for slave bulk transfer: %s", strerror(errno));
+                freeClient(slave);
+                return;
+            }
+        } else
+            putSlaveOnline(slave);
     }
 }
 
@@ -989,10 +1166,14 @@ void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
                 slave->replpreamble = sdscatprintf(sdsempty(),"$%lld\r\n",
                     (unsigned long long) slave->repldbsize);
 
-                aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
-                if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE, sendBulkToSlave, slave) == AE_ERR) {
-                    freeClient(slave);
-                    continue;
+                if (server.swap_mode && server.use_customized_replication) {
+                    slave->ssdb_status = SLAVE_SSDB_SNAPSHOT_TRANSFER_PRE;
+                } else {
+                    aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
+                    if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE, sendBulkToSlave, slave) == AE_ERR) {
+                        freeClient(slave);
+                        continue;
+                    }
                 }
             }
         }
@@ -1099,6 +1280,94 @@ void restartAOF() {
         serverLog(LL_WARNING,"FATAL: this slave instance finished the synchronization with its master, but the AOF can't be turned on. Exiting now.");
         exit(1);
     }
+}
+
+/* in swap_mode, slave redis don't know the SSDB snapshot transfer state,
+ * add this command so SSDB can send notify message to its redis after
+ * snapshot transfer completed or aborted. */
+void ssdbNotifyCommand(client* c) {
+    if (server.masterhost == NULL) {
+        addReplyError(c, "this is a master instance.");
+        c->flags |= CLIENT_CLOSE_AFTER_REPLY;
+        return;
+    }
+
+    if (!strcasecmp(c->argv[1]->ptr, "transfer")) {
+        sds s = c->argv[3]->ptr;
+        long long ssdb_snapshot_timestamp = -1;
+
+        if (string2ll(s, sdslen(s), &ssdb_snapshot_timestamp) == 0) {
+            serverLog(LL_WARNING, "wrong ssdb snapshot timestamp format for ssdb-notify-redis transfer");
+            addReplyErrorFormat(c, "wrong argument:%s", (char*)c->argv[3]->ptr);
+            return;
+        }
+        if (server.ssdb_snapshot_timestamp != ssdb_snapshot_timestamp) {
+            serverLog(LL_DEBUG, "receive 'ssdb-notify' with previous ssdb snapshot timestamp, ignore it");
+        }
+
+        if (server.repl_state >= REPL_STATE_RECEIVE_PSYNC && server.ssdb_snapshot_timestamp == ssdb_snapshot_timestamp) {
+            if (!strcasecmp(c->argv[2]->ptr, "finished")) {
+                serverLog(LL_DEBUG, "receive 'ssdb-notify transfer finished %lld'", ssdb_snapshot_timestamp);
+                server.ssdb_repl_state = REPL_STATE_TRANSFER_SSDB_SNAPSHOT_END;
+                addReply(c, shared.ok);
+                c->flags |= CLIENT_CLOSE_AFTER_REPLY;
+            } else if (!strcasecmp(c->argv[2]->ptr, "unfinished")) {
+                serverLog(LL_DEBUG, "receive 'ssdb-notify transfer unfinished %lld'", ssdb_snapshot_timestamp);
+                cancelReplicationHandshake();
+                addReply(c, shared.ok);
+                c->flags |= CLIENT_CLOSE_AFTER_REPLY;
+            } else if (!strcasecmp(c->argv[2]->ptr, "continue")) {
+                server.ssdb_repl_state = REPL_STATE_TRANSFER_SSDB_SNAPSHOT;
+                serverLog(LL_DEBUG, "receive 'ssdb-notify transfer continue %lld'", ssdb_snapshot_timestamp);
+                server.slave_ssdb_transfer_snapshot_keepalive = server.unixtime;
+                addReply(c, shared.ok);
+            } else {
+                serverLog(LL_WARNING, "unknow argument for ssdb-notify");
+                addReplyErrorFormat(c, "unknow argument:%s", (char*)c->argv[2]->ptr);
+            }
+        } else {
+            serverLog(LL_WARNING, "unexpected snapshot transfer message");
+            addReplyError(c, "unexpected snapshot transfer message");
+            c->flags |= CLIENT_CLOSE_AFTER_REPLY;
+        }
+    } else {
+        serverLog(LL_WARNING, "unknow argument for ssdb-notify");
+        addReplyErrorFormat(c, "unknow argument:%s", (char*)c->argv[1]->ptr);
+    }
+}
+
+void completeReplicationHandshake() {
+    if (server.master->ssdb_conn_flags & CONN_RECEIVE_INCREMENT_UPDATES) {
+        server.master->ssdb_conn_flags &= ~CONN_RECEIVE_INCREMENT_UPDATES;
+        /* now we can apply increment updates received from my master
+         * during SSDB snapshot transferring.
+         *
+         * confirmAndRetrySlaveSSDBwriteOp also will update ssdb connection status of
+         * server.master to CONN_SUCCESS.  */
+        confirmAndRetrySlaveSSDBwriteOp(server.master, -1, -1);
+        serverLog(LL_DEBUG, "apply increment updates on SSDB");
+    }
+
+    if (server.swap_mode) {
+        server.ssdb_repl_state = REPL_STATE_NONE;
+        server.slave_ssdb_transfer_snapshot_keepalive = -1;
+    }
+
+    server.repl_state = REPL_STATE_CONNECTED;
+    /* After a full resynchroniziation we use the replication ID and
+     * offset of the master. The secondary ID / offset are cleared since
+     * we are starting a new history. */
+    memcpy(server.replid,server.master->replid,sizeof(server.replid));
+    server.master_repl_offset = server.master->reploff;
+    clearReplicationId2();
+    /* Let's create the replication backlog if needed. Slaves need to
+     * accumulate the backlog regardless of the fact they have sub-slaves
+     * or not, in order to behave correctly if they are promoted to
+     * masters after a failover. */
+    if (server.repl_backlog == NULL) createReplicationBacklog();
+
+    server.stat_sync_full_ok++;
+    serverLog(LL_NOTICE, "MASTER <-> SLAVE sync: Finished with success");
 }
 
 /* Asynchronously read the SYNC payload we receive from a master */
@@ -1252,8 +1521,12 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
         serverLog(LL_NOTICE, "MASTER <-> SLAVE sync: Flushing old data");
         /* We need to stop any AOFRW fork before flusing and parsing
          * RDB, otherwise we'll create a copy-on-write disaster. */
-        if(aof_is_enabled) stopAppendOnly();
+        if (aof_is_enabled) stopAppendOnly();
         signalFlushedDb(-1);
+        if (server.swap_mode) {
+            emptySlaveSSDBwriteOperations();
+            cleanSpecialClientsAndIntermediateKeys(1);
+        }
         emptyDb(
             -1,
             server.repl_slave_lazy_flush ? EMPTYDB_ASYNC : EMPTYDB_NO_FLAGS,
@@ -1273,28 +1546,77 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
             if (aof_is_enabled) restartAOF();
             return;
         }
-        /* Final setup of the connected slave <- master link */
-        zfree(server.repl_transfer_tmpfile);
-        close(server.repl_transfer_fd);
-        replicationCreateMasterClient(server.repl_transfer_s,rsi.repl_stream_db);
-        server.repl_state = REPL_STATE_CONNECTED;
-        /* After a full resynchroniziation we use the replication ID and
-         * offset of the master. The secondary ID / offset are cleared since
-         * we are starting a new history. */
-        memcpy(server.replid,server.master->replid,sizeof(server.replid));
-        server.master_repl_offset = server.master->reploff;
-        clearReplicationId2();
-        /* Let's create the replication backlog if needed. Slaves need to
-         * accumulate the backlog regardless of the fact they have sub-slaves
-         * or not, in order to behave correctly if they are promoted to
-         * masters after a failover. */
-        if (server.repl_backlog == NULL) createReplicationBacklog();
 
-        serverLog(LL_NOTICE, "MASTER <-> SLAVE sync: Finished with success");
-        /* Restart the AOF subsystem now that we finished the sync. This
-         * will trigger an AOF rewrite, and when done will start appending
-         * to the new file. */
-        if (aof_is_enabled) restartAOF();
+        if (server.swap_mode && server.use_customized_replication) {
+            server.repl_state = REPL_STATE_TRANSFER_END;
+
+             /* Restart the AOF subsystem now that we finished the sync. This
+            * will trigger an AOF rewrite, and when done will start appending
+            * to the new file. */
+            if (aof_is_enabled) restartAOF();
+
+            /* setup of the connected slave <- master link */
+
+            /* At here, RDB file transfer is done but SSDB snapshot maybe has not, so we
+             * create server.master connection in advance, allow receiving increment updates
+             * to avoid accumulating too much data in my query_buf (server.master->query_buf)
+             * or output buffer of my master, which may overflow these buffers and break
+             * replication, then cause full sync again. */
+            replicationCreateMasterClient(server.repl_transfer_s, rsi.repl_stream_db);
+
+            /* when RDB file transfer is done but SSDB snapshot has not, allow receiving increment updates to avoid
+             * accumulating too much data in my query_buf(server.master->query_buf) or output buffer of my master,
+             * which may overflow these buffers and break replication, then cause full sync again. */
+            if (server.ssdb_repl_state != REPL_STATE_TRANSFER_SSDB_SNAPSHOT_END)
+                server.master->ssdb_conn_flags |= CONN_RECEIVE_INCREMENT_UPDATES;
+
+            if (C_OK != nonBlockConnectToSsdbServer(server.master)) {
+                serverLog(LL_WARNING, "Failed to connect SSDB when sync");
+                freeClient(server.master);
+                cancelReplicationHandshake();
+                return;
+            }
+            zfree(server.repl_transfer_tmpfile);
+            close(server.repl_transfer_fd);
+
+            /* SSDB snapshot transfer have not completed. must wait and return, will check
+             * server.ssdb_repl_state in replicationCron, and do the rest work of replication */
+            if (server.ssdb_repl_state != REPL_STATE_TRANSFER_SSDB_SNAPSHOT_END) {
+                serverLog(LL_DEBUG, "RDB receiving complete, wait ssdb snapshot to complete receiving");
+                server.slave_ssdb_transfer_snapshot_keepalive = server.unixtime;
+                serverAssert(server.ssdb_repl_state == REPL_STATE_NONE ||
+                             server.ssdb_repl_state == REPL_STATE_TRANSFER_SSDB_SNAPSHOT);
+                return;
+            }
+
+            completeReplicationHandshake();
+        } else {
+            /* Final setup of the connected slave <- master link */
+            replicationCreateMasterClient(server.repl_transfer_s,rsi.repl_stream_db);
+            zfree(server.repl_transfer_tmpfile);
+            close(server.repl_transfer_fd);
+
+            server.repl_state = REPL_STATE_CONNECTED;
+            /* After a full resynchroniziation we use the replication ID and
+             * offset of the master. The secondary ID / offset are cleared since
+             * we are starting a new history. */
+            memcpy(server.replid,server.master->replid,sizeof(server.replid));
+            server.master_repl_offset = server.master->reploff;
+            clearReplicationId2();
+            /* Let's create the replication backlog if needed. Slaves need to
+             * accumulate the backlog regardless of the fact they have sub-slaves
+             * or not, in order to behave correctly if they are promoted to
+             * masters after a failover. */
+            if (server.repl_backlog == NULL) createReplicationBacklog();
+
+            serverLog(LL_NOTICE, "MASTER <-> SLAVE sync: Finished with success");
+            /* Restart the AOF subsystem now that we finished the sync. This
+             * will trigger an AOF rewrite, and when done will start appending
+             * to the new file. */
+            if (aof_is_enabled) restartAOF();
+
+            if (server.swap_mode) server.use_customized_replication = 1;
+        }
     }
     return;
 
@@ -1460,7 +1782,7 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
     aeDeleteFileEvent(server.el,fd,AE_READABLE);
 
     if (!strncmp(reply,"+FULLRESYNC",11)) {
-        char *replid = NULL, *offset = NULL;
+        char *replid = NULL, *offset = NULL, *ssdb_snapshot_timestamp = NULL;
 
         /* FULL RESYNC, parse the reply in order to extract the run id
          * and the replication offset. */
@@ -1468,7 +1790,14 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
         if (replid) {
             replid++;
             offset = strchr(replid,' ');
-            if (offset) offset++;
+            if (offset) {
+                offset++;
+                if (server.swap_mode) {
+                    ssdb_snapshot_timestamp = strchr(offset, ' ');
+                    if (!ssdb_snapshot_timestamp) server.use_customized_replication = 0;
+                    if (ssdb_snapshot_timestamp) ssdb_snapshot_timestamp++;
+                }
+            }
         }
         if (!replid || !offset || (offset-replid-1) != CONFIG_RUN_ID_SIZE) {
             serverLog(LL_WARNING,
@@ -1482,9 +1811,12 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
             memcpy(server.master_replid, replid, offset-replid-1);
             server.master_replid[CONFIG_RUN_ID_SIZE] = '\0';
             server.master_initial_offset = strtoll(offset,NULL,10);
-            serverLog(LL_NOTICE,"Full resync from master: %s:%lld",
+            if (server.swap_mode && server.use_customized_replication)
+                server.ssdb_snapshot_timestamp = strtoll(ssdb_snapshot_timestamp,NULL,10);
+            serverLog(LL_NOTICE,"Full resync from master: %s:%lld:%lld",
                 server.master_replid,
-                server.master_initial_offset);
+                server.master_initial_offset,
+                server.ssdb_snapshot_timestamp);
         }
         /* We are going to full resync, discard the cached master structure. */
         replicationDiscardCachedMaster();
@@ -1843,6 +2175,8 @@ error:
     close(fd);
     server.repl_transfer_s = -1;
     server.repl_state = REPL_STATE_CONNECT;
+
+    if (server.swap_mode) server.use_customized_replication = 1;
     return;
 
 write_error: /* Handle sendSynchronousCommand(SYNC_CMD_WRITE) errors. */
@@ -1873,6 +2207,10 @@ int connectWithMaster(void) {
     server.repl_transfer_lastio = server.unixtime;
     server.repl_transfer_s = fd;
     server.repl_state = REPL_STATE_CONNECTING;
+    if (server.swap_mode) {
+        server.ssdb_repl_state = REPL_STATE_NONE;
+        server.ssdb_snapshot_timestamp = -1;
+    }
     return C_OK;
 }
 
@@ -1883,16 +2221,19 @@ int connectWithMaster(void) {
 void undoConnectWithMaster(void) {
     int fd = server.repl_transfer_s;
 
-    aeDeleteFileEvent(server.el,fd,AE_READABLE|AE_WRITABLE);
-    close(fd);
-    server.repl_transfer_s = -1;
+    if (fd != -1) {
+        aeDeleteFileEvent(server.el,fd,AE_READABLE|AE_WRITABLE);
+        close(fd);
+        server.repl_transfer_s = -1;
+    }
 }
 
 /* Abort the async download of the bulk dataset while SYNC-ing with master.
  * Never call this function directly, use cancelReplicationHandshake() instead.
  */
 void replicationAbortSyncTransfer(void) {
-    serverAssert(server.repl_state == REPL_STATE_TRANSFER);
+    serverAssert(server.repl_state == REPL_STATE_TRANSFER ||
+                 (server.swap_mode && server.repl_state == REPL_STATE_TRANSFER_END));
     undoConnectWithMaster();
     close(server.repl_transfer_fd);
     unlink(server.repl_transfer_tmpfile);
@@ -1908,7 +2249,12 @@ void replicationAbortSyncTransfer(void) {
  *
  * Otherwise zero is returned and no operation is perforemd at all. */
 int cancelReplicationHandshake(void) {
-    if (server.repl_state == REPL_STATE_TRANSFER) {
+    if (server.swap_mode) {
+        server.ssdb_repl_state = REPL_STATE_NONE;
+        server.slave_ssdb_transfer_snapshot_keepalive = -1;
+    }
+    if (server.repl_state == REPL_STATE_TRANSFER ||
+        (server.swap_mode && server.repl_state == REPL_STATE_TRANSFER_END)) {
         replicationAbortSyncTransfer();
         server.repl_state = REPL_STATE_CONNECT;
     } else if (server.repl_state == REPL_STATE_CONNECTING ||
@@ -1925,6 +2271,9 @@ int cancelReplicationHandshake(void) {
 /* Set replication to the specified master address and port. */
 void replicationSetMaster(char *ip, int port) {
     int was_master = server.masterhost == NULL;
+
+    if (server.swap_mode)
+        cleanSpecialClientsAndIntermediateKeys(0);
 
     sdsfree(server.masterhost);
     server.masterhost = sdsnew(ip);
@@ -1948,6 +2297,12 @@ void replicationSetMaster(char *ip, int port) {
 /* Cancel replication, setting the instance as a master itself. */
 void replicationUnsetMaster(void) {
     if (server.masterhost == NULL) return; /* Nothing to do. */
+
+    if (server.swap_mode) {
+        emptySlaveSSDBwriteOperations();
+        cleanSpecialClientsAndIntermediateKeys(0);
+    }
+
     sdsfree(server.masterhost);
     server.masterhost = NULL;
     /* When a slave is turned into a master, the current replication ID
@@ -2073,6 +2428,7 @@ void roleCommand(client *c) {
             case REPL_STATE_CONNECT: slavestate = "connect"; break;
             case REPL_STATE_CONNECTING: slavestate = "connecting"; break;
             case REPL_STATE_TRANSFER: slavestate = "sync"; break;
+            case REPL_STATE_TRANSFER_END: slavestate = "receiving ssdb snapshot"; break;
             case REPL_STATE_CONNECTED: slavestate = "connected"; break;
             default: slavestate = "unknown"; break;
             }
@@ -2095,6 +2451,7 @@ void replicationSendAck(void) {
         addReplyBulkCString(c,"ACK");
         addReplyBulkLongLong(c,c->reploff);
         c->flags &= ~CLIENT_MASTER_FORCE_REPLY;
+        serverLog(LL_DEBUG, "send replconf ack");
     }
 }
 
@@ -2200,6 +2557,7 @@ void replicationResurrectCachedMaster(int newfd) {
     server.cached_master = NULL;
     server.master->fd = newfd;
     server.master->flags &= ~(CLIENT_CLOSE_AFTER_REPLY|CLIENT_CLOSE_ASAP);
+    if (server.swap_mode) server.master->flags &= ~CLIENT_BUFFER_HAS_UNPROCESSED_DATA;
     server.master->authenticated = 1;
     server.master->lastinteraction = server.unixtime;
     server.repl_state = REPL_STATE_CONNECTED;
@@ -2219,6 +2577,13 @@ void replicationResurrectCachedMaster(int newfd) {
                           sendReplyToClient, server.master)) {
             serverLog(LL_WARNING,"Error resurrecting the cached master, impossible to add the writable handler: %s", strerror(errno));
             freeClientAsync(server.master); /* Close ASAP. */
+        }
+    }
+
+    if (server.swap_mode && !server.master->context) {
+        if (C_OK != nonBlockConnectToSsdbServer(server.master)) {
+            /* will reconnect if we can't connect SSDB here. */
+            serverLog(LL_WARNING,"resurrecting the cached master, can't connect SSDB");
         }
     }
 }
@@ -2485,11 +2850,59 @@ long long replicationGetSlaveOffset(void) {
     return offset;
 }
 
+/* abort all slaves in replication status, except online slaves. */
+void abortCustomizedReplication() {
+    listIter li;
+    listNode *ln;
+
+    server.check_write_begin_time = -1;
+    server.make_snapshot_begin_time = -1;
+    server.is_allow_ssdb_write = ALLOW_SSDB_WRITE;
+    server.ssdb_status = SSDB_NONE;
+
+    listRewind(server.slaves, &li);
+
+    while((ln = listNext(&li))) {
+        client *slave = ln->value;
+
+        if (slave->replstate >= SLAVE_STATE_WAIT_BGSAVE_START &&
+            slave->replstate <= SLAVE_STATE_SEND_BULK_FINISHED) {
+            addReplyError(slave, "replication aborted by master");
+            freeClientAsync(slave);
+        }
+    }
+}
+
+/* TODO: could be replaced by abortCustomizedReplication ??? */
+/* disconnect slaves in replication handshake status and before BGSAVE stage. */
+void resetCustomizedReplication() {
+    listIter li;
+    listNode *ln;
+
+    server.check_write_begin_time = -1;
+    server.make_snapshot_begin_time = -1;
+    server.is_allow_ssdb_write = ALLOW_SSDB_WRITE;
+    server.ssdb_status = SSDB_NONE;
+
+    listRewind(server.slaves, &li);
+
+    while((ln = listNext(&li))) {
+        client *slave = ln->value;
+
+        if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) {
+            addReplyError(slave, "SSDB exceptions, replication can't continue");
+            freeClientAsync(slave);
+        }
+    }
+}
+
+
 /* --------------------------- REPLICATION CRON  ---------------------------- */
 
 /* Replication cron function, called 1 time per second. */
 void replicationCron(void) {
     static long long replication_cron_loops = 0;
+    serverLog(LL_DEBUG, "Replication log: replicationCron");
 
     /* Non blocking connection timeout? */
     if (server.masterhost &&
@@ -2505,8 +2918,27 @@ void replicationCron(void) {
     if (server.masterhost && server.repl_state == REPL_STATE_TRANSFER &&
         (time(NULL)-server.repl_transfer_lastio) > server.repl_timeout)
     {
-        serverLog(LL_WARNING,"Timeout receiving bulk data from MASTER... If the problem persists try to set the 'repl-timeout' parameter in redis.conf to a larger value.");
+        serverLog(LL_WARNING,"Timeout receiving bulk data from MASTER... If the problem "
+                "persists try to set the 'repl-timeout' parameter in redis.conf to a larger value.");
         cancelReplicationHandshake();
+    }
+
+    /* when RDB transfer is done but SSDB snapshot transfer have not, we check whether it's ok now
+     * or we don't receive notify message from SSDB for a long time. */
+    if (server.swap_mode && server.masterhost && server.repl_state == REPL_STATE_TRANSFER_END) {
+        if (server.ssdb_repl_state == REPL_STATE_TRANSFER_SSDB_SNAPSHOT_END) {
+            /* RDB and SSDB snapshot transfer is done, now it's time to complete replication handshake. */
+            serverLog(LL_DEBUG, "SSDB snapshot receiving complete, establish replication handshake success.");
+            completeReplicationHandshake();
+        } else if (server.ssdb_repl_state == REPL_STATE_NONE || server.ssdb_repl_state == REPL_STATE_TRANSFER_SSDB_SNAPSHOT) {
+            if ((server.unixtime - server.slave_ssdb_transfer_snapshot_keepalive) > server.slave_transfer_ssdb_snapshot_timeout) {
+                /* we don't receive snapshot transfer message from SSDB for a long time */
+                serverAssert(server.slave_ssdb_transfer_snapshot_keepalive != -1);
+                serverLog(LL_DEBUG, "don't receive SSDB snapshot transfer message for a long "
+                        "time, cancel replication handshake");
+                cancelReplicationHandshake();
+            }
+        }
     }
 
     /* Timed out master when we are an already connected slave? */
@@ -2551,6 +2983,17 @@ void replicationCron(void) {
         decrRefCount(ping_argv[0]);
     }
 
+    /* Process the case of ssdb write check timeout or ssdb make snapshot failed. */
+    if (server.swap_mode && server.use_customized_replication) {
+        /* TODO : use a reasonable timeout to replace 5 seconds. */
+        if (server.check_write_begin_time != -1
+             && (server.unixtime - server.check_write_begin_time > 5))
+            resetCustomizedReplication();
+        if (server.make_snapshot_begin_time != -1 &&
+                (server.unixtime - server.make_snapshot_begin_time > 5))
+            resetCustomizedReplication();
+    }
+
     /* Second, send a newline to all the slaves in pre-synchronization
      * stage, that is, slaves waiting for the master to create the RDB file.
      *
@@ -2566,6 +3009,7 @@ void replicationCron(void) {
      * ping period and refresh the connection once per second since certain
      * timeouts are set at a few seconds (example: PSYNC response). */
     listRewind(server.slaves,&li);
+    serverLog(LL_DEBUG, "Replication log: slaves length: %ld", listLength(server.slaves));
     while((ln = listNext(&li))) {
         client *slave = ln->value;
 
@@ -2579,6 +3023,114 @@ void replicationCron(void) {
                 /* Don't worry about socket errors, it's just a ping. */
             }
         }
+
+        /* flushall/flushdb is done, and we can begin replication now. */
+        if (!server.is_doing_flushall &&
+            server.ssdb_status == MASTER_SSDB_SNAPSHOT_WAIT_FLUSHALL &&
+            slave->ssdb_status == SLAVE_SSDB_SNAPSHOT_WAIT_FLUSHALL) {
+            prepareSSDBreplication(slave);
+            continue;
+        }
+
+        serverLog(LL_DEBUG, "Replication log: server.ssdb_status: %d, slave->ssdb_status: %d, slave->replstate: %d",
+                  server.ssdb_status, slave->ssdb_status, slave->replstate);
+        if (server.swap_mode && server.use_customized_replication
+            && (server.ssdb_status == MASTER_SSDB_SNAPSHOT_OK)
+            && (slave->ssdb_status == SLAVE_SSDB_SNAPSHOT_TRANSFER_PRE)) {
+            char buf[64];
+            char ssdb_snapshot_timestamp[64];
+            char * argv[4];
+
+            ll2string(buf, 64, slave->slave_listening_port + SSDB_SLAVE_PORT_INCR);
+            ll2string(ssdb_snapshot_timestamp, 64, server.ssdb_snapshot_timestamp);
+
+            argv[0] = "rr_transfer_snapshot";
+            argv[1] = slave->client_ip;
+            argv[2] = buf;
+            argv[3] = ssdb_snapshot_timestamp;
+
+            /* cmsds will be consumed by sendCommandToSSDB. */
+            sds cmdsds = composeRedisCmd(4, (const char **)argv, NULL);
+
+            if (cmdsds && sendCommandToSSDB(slave, cmdsds) != C_OK) {
+                serverLog(LL_WARNING,
+                          "Replication log: Sending rr_transfer_snapshot to SSDB failed.");
+                /* continue to avoid acess invalid slave pointer later. */
+                continue;
+            } else {
+                // todo: test and use a suitable timeout
+                /* handle response timeout in timer function. */
+                long long timer_id = aeCreateTimeEvent(server.el,5000,
+                    handleResponseTimeoutOfTransferSnapshot,slave,NULL);
+                if (timer_id  == AE_ERR) {
+                    freeClient(slave);
+                    /* continue to avoid acess invalid slave pointer later. */
+                    continue;
+                }
+                slave->repl_timer_id = timer_id;
+                serverLog(LL_DEBUG, "Replication log: Sending rr_transfer_snapshot to SSDB, fd: %d", slave->fd);
+            }
+        }
+
+        if (server.swap_mode && server.use_customized_replication) {
+            if (slave->ssdb_status == SLAVE_SSDB_SNAPSHOT_TRANSFER_START &&
+                (server.unixtime - slave->transfer_snapshot_last_keepalive_time)
+                    > server.master_transfer_ssdb_snapshot_timeout) {
+                serverLog(LL_WARNING, "have not received SSDB transfer snapshot keepalive message in %d "
+                          "seconds, disconnect the slave(%s:%d)!", server.master_transfer_ssdb_snapshot_timeout,
+                          slave->client_ip, slave->slave_listening_port);
+                freeClient(slave);
+                continue;
+            }
+            if (slave->replstate == SLAVE_STATE_SEND_BULK_FINISHED
+                && slave->ssdb_status == SLAVE_SSDB_SNAPSHOT_TRANSFER_END) {
+                putSlaveOnline(slave);
+                slave->ssdb_status = SSDB_NONE;
+                serverLog(LL_DEBUG, "Replication log: replication done: %d", slave->fd);
+            }
+        }
+    }
+
+    /* slave wait for flushall is disconnected and freed, need reset server.ssdb_status */
+    if (!server.is_doing_flushall && server.ssdb_status == MASTER_SSDB_SNAPSHOT_WAIT_FLUSHALL) {
+        server.ssdb_status = SSDB_NONE;
+    }
+
+    if (server.swap_mode && server.use_customized_replication
+        && server.ssdb_status == MASTER_SSDB_SNAPSHOT_OK) {
+        int has_slave_in_transfer = 0;
+        int max_replstate = REPL_STATE_NONE;
+        int max_slave_ssdb_status = SSDB_NONE;
+        listRewind(server.slaves,&li);
+        while((ln = listNext(&li))) {
+            client *slave = ln->value;
+            if (slave->replstate >= SLAVE_STATE_WAIT_BGSAVE_START &&
+                slave->replstate < SLAVE_STATE_ONLINE) {
+                has_slave_in_transfer = 1;
+            }
+
+            max_slave_ssdb_status = slave->ssdb_status > max_slave_ssdb_status ? slave->ssdb_status : max_slave_ssdb_status;
+            max_replstate = slave->replstate > max_replstate ? slave->replstate: max_replstate;
+            serverLog(LL_DEBUG, "Replication log: slave->replstate: %d, max_replstate: %d, slave->ssdb_status: %d",
+                      slave->replstate, max_replstate, slave->ssdb_status);
+        }
+        if (max_replstate == SLAVE_STATE_ONLINE
+            && !has_slave_in_transfer) {
+            server.ssdb_status = SSDB_NONE;
+
+            /* tell redis to delete SSDB snapshot. */
+            sendDelSSDBsnapshot();
+        }
+        /* if redis fails to transfer RDB to its slaves, the slave client will be disconnected and freed, we check
+         * these cases here to avoid potential replication deadlock issues. */
+        if (0 == listLength(server.slaves) || max_slave_ssdb_status == SSDB_NONE) {
+            resetCustomizedReplication();
+        }
+    }
+
+    if (server.swap_mode && server.use_customized_replication &&
+                            server.ssdb_status == SSDB_NONE && server.retry_del_snapshot) {
+        sendDelSSDBsnapshot();
     }
 
     /* Disconnect timedout slaves. */
@@ -2637,8 +3189,12 @@ void replicationCron(void) {
      * In case of diskless replication, we make sure to wait the specified
      * number of seconds (according to configuration) so that other slaves
      * have the time to arrive before we start streaming. */
+
+    /* in swap_mode, we delay BGSAVE til the redis RDB and ssdb data send
+     * completely, to avoid high network overload. */
     if (server.rdb_child_pid == -1 && server.aof_child_pid == -1) {
         time_t idle, max_idle = 0;
+        int can_bgsave = 0;
         int slaves_waiting = 0;
         int mincapa = -1;
         listNode *ln;
@@ -2653,13 +3209,24 @@ void replicationCron(void) {
                 slaves_waiting++;
                 mincapa = (mincapa == -1) ? slave->slave_capa :
                                             (mincapa & slave->slave_capa);
+
+                if (server.swap_mode && server.use_customized_replication) {
+                    if (server.ssdb_status == MASTER_SSDB_SNAPSHOT_OK &&
+                        slave->ssdb_status == SLAVE_SSDB_SNAPSHOT_IN_PROCESS) {
+                        can_bgsave = 1;
+                    }
+                }
             }
         }
 
-        if (slaves_waiting &&
+        if (server.swap_mode && server.use_customized_replication) {
+            if (can_bgsave) {
+                startBgsaveForReplication(mincapa);
+                server.is_allow_ssdb_write = ALLOW_SSDB_WRITE;
+            }
+        } else if (slaves_waiting &&
             (!server.repl_diskless_sync ||
-             max_idle > server.repl_diskless_sync_delay))
-        {
+             max_idle > server.repl_diskless_sync_delay)) {
             /* Start the BGSAVE. The called function may start a
              * BGSAVE with socket target or disk target depending on the
              * configuration and slaves capabilities. */

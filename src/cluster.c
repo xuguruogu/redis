@@ -186,6 +186,7 @@ int clusterLoadConfig(char *filename) {
             if (p) *p = '\0';
             if (!strcasecmp(s,"myself")) {
                 serverAssert(server.cluster->myself == NULL);
+                n->datacenter_id = server.datacenter_id;
                 myself = server.cluster->myself = n;
                 n->flags |= CLUSTER_NODE_MYSELF;
             } else if (!strcasecmp(s,"master")) {
@@ -441,6 +442,7 @@ void clusterInit(void) {
          * by the createClusterNode() function. */
         myself = server.cluster->myself =
             createClusterNode(NULL,CLUSTER_NODE_MYSELF|CLUSTER_NODE_MASTER);
+        myself->datacenter_id = server.datacenter_id;
         serverLog(LL_NOTICE,"No cluster configuration found, I'm %.40s",
             myself->name);
         clusterAddNode(myself);
@@ -695,6 +697,7 @@ clusterNode *createClusterNode(char *nodename, int flags) {
     node->orphaned_time = 0;
     node->repl_offset_time = 0;
     node->repl_offset = 0;
+    node->datacenter_id = 0;
     listSetFreeMethod(node->fail_reports,zfree);
     return node;
 }
@@ -1623,6 +1626,7 @@ int clusterProcessPacket(clusterLink *link) {
         return 1;
     }
 
+    unsigned char datacenter_id = hdr->datacenter_id;
     uint16_t flags = ntohs(hdr->flags);
     uint64_t senderCurrentEpoch = 0, senderConfigEpoch = 0;
     clusterNode *sender;
@@ -1676,6 +1680,11 @@ int clusterProcessPacket(clusterLink *link) {
             sender->configEpoch = senderConfigEpoch;
             clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
                                  CLUSTER_TODO_FSYNC_CONFIG);
+        }
+        if (sender->datacenter_id != datacenter_id) {
+            serverLog(LL_NOTICE, "node(%s:%d) datacenter-id changed from %u to %u",
+                      sender->ip, sender->port, sender->datacenter_id, datacenter_id);
+            sender->datacenter_id = datacenter_id;
         }
         /* Update the replication offset info for this node. */
         sender->repl_offset = ntohu64(hdr->offset);
@@ -2238,6 +2247,7 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
     /* Set the currentEpoch and configEpochs. */
     hdr->currentEpoch = htonu64(server.cluster->currentEpoch);
     hdr->configEpoch = htonu64(master->configEpoch);
+    hdr->datacenter_id = server.datacenter_id;
 
     /* Set the replication offset. */
     if (nodeIsSlave(myself))
@@ -2601,6 +2611,11 @@ void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request) {
     int force_ack = request->mflags[0] & CLUSTERMSG_FLAG0_FORCEACK;
     int j;
 
+    unsigned char node_datacenter_id = request->datacenter_id;
+
+    /* the node is not in the same datacenter with his master and not a manual failover.*/
+    if (node_datacenter_id != master->datacenter_id && !force_ack) return;
+
     /* IF we are not a master serving at least 1 slot, we don't have the
      * right to vote, as the cluster size in Redis Cluster is the number
      * of masters serving at least one slot, and quorum is the cluster
@@ -2717,9 +2732,24 @@ int clusterGetSlaveRank(void) {
     if (master == NULL) return 0; /* Never called by slaves without master. */
 
     myoffset = replicationGetSlaveOffset();
-    for (j = 0; j < master->numslaves; j++)
-        if (master->slaves[j] != myself &&
-            master->slaves[j]->repl_offset > myoffset) rank++;
+    for (j = 0; j < master->numslaves; j++) {
+        if (master->slaves[j] != myself) {
+            if (server.datacenter_id != master->datacenter_id) {
+                if (master->slaves[j]->datacenter_id == master->datacenter_id) {
+                    rank++;
+                } else {
+                    if (master->slaves[j]->repl_offset > myoffset) {
+                        rank++;
+                    }
+                }
+            } else {
+                if (master->slaves[j]->datacenter_id == master->datacenter_id &&
+                    master->slaves[j]->repl_offset > myoffset) {
+                    rank++;
+                }
+            }
+        }
+    }
     return rank;
 }
 
@@ -2778,6 +2808,9 @@ void clusterLogCantFailover(int reason) {
         break;
     case CLUSTER_CANT_FAILOVER_WAITING_VOTES:
         msg = "Waiting for votes, but majority still not reached.";
+        break;
+    case CLUSTER_CANT_FAILOVER_WILL_LOST_SSDB_WRITES:
+        msg = "there remain failed ssdb writes unprocessed.";
         break;
     default:
         msg = "Unknown reason code.";
@@ -2868,6 +2901,12 @@ void clusterHandleSlaveFailover(void) {
         return;
     }
 
+    if (myself->slaveof->datacenter_id != myself->datacenter_id && !manual_failover) {
+        server.cluster->cant_failover_reason = CLUSTER_CANT_FAILOVER_OTHER_DATACENTER;
+        clusterLogCantFailover(CLUSTER_CANT_FAILOVER_OTHER_DATACENTER);
+        return;
+    }
+
     /* Set data_age to the number of seconds we are disconnected from
      * the master. */
     if (server.repl_state == REPL_STATE_CONNECTED) {
@@ -2894,6 +2933,15 @@ void clusterHandleSlaveFailover(void) {
     {
         if (!manual_failover) {
             clusterLogCantFailover(CLUSTER_CANT_FAILOVER_DATA_AGE);
+            return;
+        }
+    }
+
+    if (server.swap_mode) {
+        if (!manual_failover && listLength(server.ssdb_write_oplist) > 0
+            && ((server.master && !(server.master->ssdb_conn_flags & CONN_SUCCESS))
+                || (server.cached_master && !(server.cached_master->ssdb_conn_flags & CONN_SUCCESS)))) {
+            clusterLogCantFailover(CLUSTER_CANT_FAILOVER_WILL_LOST_SSDB_WRITES);
             return;
         }
     }
@@ -3174,7 +3222,8 @@ void clusterHandleManualFailover(void) {
 
     if (server.cluster->mf_master_offset == 0) return; /* Wait for offset... */
 
-    if (server.cluster->mf_master_offset == replicationGetSlaveOffset()) {
+    if (server.cluster->mf_master_offset == replicationGetSlaveOffset() &&
+            (!server.swap_mode || (server.swap_mode && 0 == listLength(server.ssdb_write_oplist)))) {
         /* Our replication offset matches the master replication offset
          * announced after clients were paused. We can start the failover. */
         server.cluster->mf_can_start = 1;
@@ -3202,6 +3251,12 @@ void clusterCron(void) {
     mstime_t handshake_timeout;
 
     iteration++; /* Number of times this function was called so far. */
+
+    if (nodeDatacenterChanged(myself)) {
+        /* braodcast my config to all nodes so they will update their datacenter-id of me. */
+        clusterBroadcastPong(CLUSTER_BROADCAST_ALL);
+        myself->flags &= ~CLUSTER_NODE_DATACENTER_CHANGED;
+    }
 
     /* We want to take myself->ip in sync with the cluster-announce-ip option.
      * The option can be set at runtime via CONFIG SET, so we periodically check
@@ -3759,6 +3814,8 @@ int verifyClusterConfigWithData(void) {
 
     /* Make sure we only have keys in DB0. */
     for (j = 1; j < server.dbnum; j++) {
+        if (server.swap_mode && j == EVICTED_DATA_DBID) continue;
+
         if (dictSize(server.db[j].dict)) return C_ERR;
     }
 
@@ -4106,7 +4163,8 @@ void clusterCommand(client *c) {
         clusterReplyMultiBulkSlots(c);
     } else if (!strcasecmp(c->argv[1]->ptr,"flushslots") && c->argc == 2) {
         /* CLUSTER FLUSHSLOTS */
-        if (dictSize(server.db[0].dict) != 0) {
+        if (dictSize(server.db[0].dict) != 0 ||
+                (server.swap_mode && dictSize(EVICTED_DATA_DB->dict) != 0)) {
             addReplyError(c,"DB must be empty to perform CLUSTER FLUSHSLOTS.");
             return;
         }
@@ -4440,8 +4498,9 @@ void clusterCommand(client *c) {
         /* If the instance is currently a master, it should have no assigned
          * slots nor keys to accept to replicate some other node.
          * Slaves can switch to another master without issues. */
-        if (nodeIsMaster(myself) &&
-            (myself->numslots != 0 || dictSize(server.db[0].dict) != 0)) {
+        if ((nodeIsMaster(myself) &&
+             (myself->numslots != 0 || dictSize(server.db[0].dict) != 0)) ||
+                (server.swap_mode && dictSize(EVICTED_DATA_DB->dict) != 0)) {
             addReplyError(c,
                 "To set a master the node must be empty and "
                 "without assigned slots.");
@@ -4713,6 +4772,19 @@ void restoreCommand(client *c) {
         return;
     }
 
+    if (server.swap_mode
+        && !replace
+        && ((!strcasecmp(c->cmd->name, "restoressdbkey")
+             || !strcasecmp(c->cmd->name, "restore-asking"))
+            && lookupKeyWrite(EVICTED_DATA_DB,c->argv[1]) != NULL)) {
+        addReply(c,shared.busykeyerr);
+
+        /* Run storetossdb asynchronously. */
+        listAddNodeTail(server.storetossdb_migrate_keys, c->argv[1]);
+        incrRefCount(c->argv[1]);
+        return;
+    }
+
     /* Check if the TTL value makes sense */
     if (getLongLongFromObjectOrReply(c,c->argv[2],&ttl,NULL) != C_OK) {
         return;
@@ -4975,8 +5047,13 @@ try_again:
         if (server.cluster_enabled)
             serverAssertWithInfo(c,NULL,
                 rioWriteBulkString(&cmd,"RESTORE-ASKING",14));
-        else
-            serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"RESTORE",7));
+        else {
+            if (server.swap_mode)
+                serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"RESTORESSDBKEY",14));
+            else
+                serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"RESTORE",7));
+        }
+
         serverAssertWithInfo(c,NULL,sdsEncodedObject(kv[j]));
         serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,kv[j]->ptr,
                 sdslen(kv[j]->ptr)));
@@ -4985,9 +5062,15 @@ try_again:
         /* Emit the payload argument, that is the serialized object using
          * the DUMP format. */
         createDumpPayload(&payload,ov[j]);
-        serverAssertWithInfo(c,NULL,
-            rioWriteBulkString(&cmd,payload.io.buffer.ptr,
-                               sdslen(payload.io.buffer.ptr)));
+        if (server.swap_mode && (c->flags & BLOCKED_MIGRATING_DUMP))
+            /* c->ssdb_replies will be free later. */
+            serverAssertWithInfo(c,NULL,
+                                 rioWriteBulkString(&cmd,c->ssdb_replies[0]->str,
+                                                    c->ssdb_replies[0]->len));
+        else
+            serverAssertWithInfo(c,NULL,
+                                 rioWriteBulkString(&cmd,payload.io.buffer.ptr,
+                                                    sdslen(payload.io.buffer.ptr)));
         sdsfree(payload.io.buffer.ptr);
 
         /* Add the REPLACE option to the RESTORE command if it was specified
@@ -5025,6 +5108,7 @@ try_again:
     int error_from_target = 0;
     int socket_error = 0;
     int del_idx = 1; /* Index of the key argument for the replicated DEL op. */
+    int error_from_ssdb = 0;
 
     if (!copy) newargv = zmalloc(sizeof(robj*)*(num_keys+1));
 
@@ -5044,6 +5128,36 @@ try_again:
         } else {
             if (!copy) {
                 /* No COPY option: remove the local key, signal the change. */
+                if (server.swap_mode && (c->flags & BLOCKED_MIGRATING_DUMP)) {
+                    char *argv[2];
+                    sds delcmd;
+                    size_t argvlen[2];
+                    redisReply *replies[2] = {0};
+
+                    argv[0] = "del";
+                    argv[1] = kv[j]->ptr;
+                    argvlen[0] = 3;
+                    argvlen[1] = sdslen(argv[1]);
+                    delcmd = composeRedisCmd(2, (const char **) argv, argvlen);
+                    if (!delcmd || sendCommandToSSDB(c, delcmd) != C_OK) {
+                        error_from_ssdb = 1;
+                        addReplyError(c, "migrate del error in ssdb.");
+                        break;
+                    }
+
+                    /*TODO: set a reasonable timeout. */
+                    if (syncReadReply(c->context,(void *) &replies[0], 5000) == REDIS_ERR
+                        || (replies[0]->type == REDIS_REPLY_INTEGER
+                            && replies[0]->integer == 0)
+                        || (syncReadReply(c->context, (void *)&replies[1], 5000) == REDIS_ERR))
+                        error_from_ssdb = 1;
+
+                    freeReplyObject(replies[0]);
+                    freeReplyObject(replies[1]);
+
+                    if (error_from_ssdb) break;
+                }
+
                 dbDelete(c->db,kv[j]);
                 signalModifiedKey(c->db,kv[j]);
                 server.dirty++;
@@ -5059,7 +5173,7 @@ try_again:
      * command vector. We only retry if we are sure nothing was processed
      * and we failed to read the first reply (j == 0 test). */
     if (!error_from_target && socket_error && j == 0 && may_retry &&
-        errno != ETIMEDOUT)
+        errno != ETIMEDOUT && !error_from_ssdb)
     {
         goto socket_err; /* A retry is guaranteed because of tested conditions.*/
     }
@@ -5088,12 +5202,12 @@ try_again:
     /* If we are here and a socket error happened, we don't want to retry.
      * Just signal the problem to the client, but only do it if we did not
      * already queue a different error reported by the destination server. */
-    if (!error_from_target && socket_error) {
+    if (!error_from_target && socket_error && !error_from_ssdb) {
         may_retry = 0;
         goto socket_err;
     }
 
-    if (!error_from_target) {
+    if (!error_from_target && !error_from_ssdb) {
         /* Success! Update the last_dbid in migrateCachedSocket, so that we can
          * avoid SELECT the next time if the target DB is the same. Reply +OK.
          *

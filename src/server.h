@@ -73,9 +73,43 @@ typedef long long mstime_t; /* millisecond time type. */
 #include "endianconv.h"
 #include "crc64.h"
 
+/* used this macro when compile hiredis to avoid wrongly including sds header file. */
+#define HIREDIS_WITHOUT_SDS
+#include "hiredis.h"
+
 /* Error codes */
 #define C_OK                    0
 #define C_ERR                   -1
+#define C_FD_ERR                -2
+#define C_NOTSUPPORT_ERR        -3
+#define C_ANOTHER_FLUSHALL_ERR  -4
+#define C_RETURN                -5
+#define C_BLOCKED               -6
+#define C_NO_EXPIRE             -7
+
+/* SSDB connection flags in swap_mode */
+#define CONN_CONNECT_FAILED         (1<<0)
+#define CONN_CONNECTING             (1<<1)
+#define CONN_RECEIVE_INCREMENT_UPDATES (1<<2) /* for server.master only, when RDB file transfer
+ * is done but SSDB snapshot file has not, we save increment updates about SSDB data in
+ * server.ssdb_write_oplist. after SSDB snapshot transfer is done, we apply these increment updates
+ * to SSDB. */
+#define CONN_CHECK_REPOPID          (1<<3) /* for server.master/server.cached_master only */
+#define CONN_SUCCESS                (1<<4) /* now we can send command to SSDB. */
+#define CONN_WAIT_WRITE_CHECK_REPLY (1<<9) /* for check write in replication process */
+#define CONN_WAIT_FLUSH_CHECK_REPLY (1<<10) /* for flush check when process 'flushall' */
+
+/* Default max argc of cmds sended to SSDB. */
+#define SSDB_CMD_DEFAULT_MAX_ARGC 10
+
+#define SSDB_SLAVE_PORT_INCR 20000 /* SSDB port = redis port + PORT_INCR */
+
+/* is_allow_ssdb_write codes */
+#define ALLOW_SSDB_WRITE 1
+#define DISALLOW_SSDB_WRITE 0
+
+#define PROHIBIT_SSDB_READ_WRITE 1
+#define NO_PROHIBIT_SSDB_READ_WRITE 0
 
 /* Static server configuration */
 #define CONFIG_DEFAULT_HZ        10      /* Time interrupt calls/sec. */
@@ -98,7 +132,9 @@ typedef long long mstime_t; /* millisecond time type. */
 #define AOF_READ_DIFF_INTERVAL_BYTES (1024*10)
 #define CONFIG_DEFAULT_SLOWLOG_LOG_SLOWER_THAN 10000
 #define CONFIG_DEFAULT_SLOWLOG_MAX_LEN 128
-#define CONFIG_DEFAULT_MAX_CLIENTS 10000
+/* for swap mode, maxclients is 10W */
+//#define CONFIG_DEFAULT_MAX_CLIENTS 10000
+#define CONFIG_DEFAULT_MAX_CLIENTS 100000
 #define CONFIG_AUTHPASS_MAX_LEN 512
 #define CONFIG_DEFAULT_SLAVE_PRIORITY 100
 #define CONFIG_DEFAULT_REPL_TIMEOUT 60
@@ -119,6 +155,9 @@ typedef long long mstime_t; /* millisecond time type. */
 #define CONFIG_DEFAULT_UNIX_SOCKET_PERM 0
 #define CONFIG_DEFAULT_TCP_KEEPALIVE 300
 #define CONFIG_DEFAULT_PROTECTED_MODE 1
+#define CONFIG_DEFAULT_SWAP_MODE 1
+#define CONFIG_DEFAULT_LOAD_FROM_SSDB 1
+#define CONFIG_DEFAULT_USE_CUSTOMIZED_REPLICATION 1
 #define CONFIG_DEFAULT_LOGFILE ""
 #define CONFIG_DEFAULT_SYSLOG_ENABLED 0
 #define CONFIG_DEFAULT_STOP_WRITES_ON_BGSAVE_ERROR 1
@@ -132,6 +171,8 @@ typedef long long mstime_t; /* millisecond time type. */
 #define CONFIG_DEFAULT_SLAVE_ANNOUNCE_IP NULL
 #define CONFIG_DEFAULT_SLAVE_ANNOUNCE_PORT 0
 #define CONFIG_DEFAULT_REPL_DISABLE_TCP_NODELAY 0
+#define CONFIG_DEFAULT_SSDB_LOAD_UPPER_LIMIT 0
+#define CONFIG_DEFAULT_SSDB_TRANSFER_LOWER_LIMIT 0
 #define CONFIG_DEFAULT_MAXMEMORY 0
 #define CONFIG_DEFAULT_MAXMEMORY_SAMPLES 5
 #define CONFIG_DEFAULT_LFU_LOG_FACTOR 10
@@ -160,6 +201,15 @@ typedef long long mstime_t; /* millisecond time type. */
 #define CONFIG_DEFAULT_DEFRAG_IGNORE_BYTES (100<<20) /* don't defrag if frag overhead is below 100mb */
 #define CONFIG_DEFAULT_DEFRAG_CYCLE_MIN 25 /* 25% CPU min (at lower threshold) */
 #define CONFIG_DEFAULT_DEFRAG_CYCLE_MAX 75 /* 75% CPU max (at upper threshold) */
+
+/* swap-mode timeout configuration */
+#define CONFIG_DEFAULT_CLIENT_VISITING_SSDB_TIMEOUT 5000 /* Microseconds */
+#define CONFIG_DEFAULT_CLIENT_BLOCKED_BY_KEYS_TIMEOUT 5000 /* Microseconds */
+#define CONFIG_DEFAULT_CLIENT_BLOCKED_BY_FLUSHALL_TIMEOUT 5000 /* Microseconds */
+#define CONFIG_DEFAULT_CLIENT_BLOCKED_BY_MIGRATE_DUMP_TIMEOUT 90000 /* Microseconds */
+#define CONFIG_DEFAULT_CLIENT_BLOCKED_BY_MIGRATE_TIMEOUT 5000 /* Microseconds */
+#define CONFIG_DEFAULT_SLAVE_BLOCKED_BY_FLUSHALL_TIMEOUT 8000 /* Microseconds */
+#define CONFIG_DEFAULT_CLIENT_BLOCKED_BY_REPLICATION_NOWRITE_TIMEOUT 5000 /* Microseconds */
 
 #define ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP 20 /* Loopkups per loop. */
 #define ACTIVE_EXPIRE_CYCLE_FAST_DURATION 1000 /* Microseconds */
@@ -211,6 +261,10 @@ typedef long long mstime_t; /* millisecond time type. */
 #define CMD_MODULE_GETKEYS (1<<14)  /* Use the modules getkeys interface. */
 #define CMD_MODULE_NO_CLUSTER (1<<15) /* Deny on Redis Cluster. */
 
+#define CMD_SWAP_MODE (1<<22)       /* "J" flag */
+#define CMD_SWAPMODE_REDIS_ONLY (1<<23) /* "j" flag */
+#define CMD_SWAPMODE_NOT_ALLOWED (1<<24)/* "n" flag */
+
 /* AOF states */
 #define AOF_OFF 0             /* AOF is off */
 #define AOF_ON 1              /* AOF is on */
@@ -248,6 +302,13 @@ typedef long long mstime_t; /* millisecond time type. */
 #define CLIENT_LUA_DEBUG (1<<25)  /* Run EVAL in debug mode. */
 #define CLIENT_LUA_DEBUG_SYNC (1<<26)  /* EVAL debugging without fork() */
 #define CLIENT_MODULE (1<<27) /* Non connected client used by some module. */
+/* for swap mode only */
+#define CLIENT_SLAVE_FORCE_PROPAGATE (1<<28) /* Force to propagate before SLAVE_STATE_ONLINE. */
+#define CLIENT_CLOSE_AFTER_SSDB_WRITE_PROPAGATE (1<<29) /* if the client is blocked by visiting ssdb, close after
+ * we receive write reply from SSDB and propagate write operation to slaves, to avoid some data inconsistency because
+ * of connection disconnect of user side. */
+#define CLIENT_BUFFER_HAS_UNPROCESSED_DATA (1<<30) /* we need process remained query data in the client buffer */
+
 
 /* Client block type (btype field in client structure)
  * if CLIENT_BLOCKED flag is set. */
@@ -255,6 +316,26 @@ typedef long long mstime_t; /* millisecond time type. */
 #define BLOCKED_LIST 1    /* BLPOP & co. */
 #define BLOCKED_WAIT 2    /* WAIT for synchronous replication. */
 #define BLOCKED_MODULE 3  /* Blocked by a loadable module. */
+
+/* ================================================= */
+/* the following types are blocked by other clients. */
+#define BLOCKED_SSDB_LOADING_OR_TRANSFER 10 /* Blocked when loading a key becomes hot in SSDB
+                                    * or transferring a key becomes cold to SSDB. */
+#define BLOCKED_NO_WRITE_TO_SSDB 11 /* Client is blocked as during the process of psync. */
+#define BLOCKED_NO_READ_WRITE_TO_SSDB 12 /* Client is blocked by ssdb flushall. */
+#define BLOCKED_WRITE_SAME_SSDB_KEY 13 /* client is blocked by another write on the same ssdb key*/
+/* ================================================= */
+/* the following types are blocked by the client itself. if block timeout, we must
+ * disconnect this client to avoid receiving an unexpected response later, which may
+ * cause strange issues such as crash(eg, SWAP-44), etc. */
+#define BLOCKED_VISITING_SSDB 20   /* Client is visiting SSDB. */
+#define BLOCKED_BY_FLUSHALL  21
+#define BLOCKED_BY_DELETE_CONFIRM  22 /* Client is blocked by delete key confirm. */
+#define BLOCKED_BY_EXPIRED_DELETE 23 /* Client is blocked by delete expired ssdb keys. */
+#define BLOCKED_MIGRATING_CLIENT  24
+#define BLOCKED_MIGRATING_DUMP  25 /* Client is migrating in SSDB. */
+/* ================================================= */
+
 
 /* Client request types */
 #define PROTO_REQ_INLINE 1
@@ -289,7 +370,15 @@ typedef long long mstime_t; /* millisecond time type. */
 #define REPL_STATE_RECEIVE_PSYNC 13 /* Wait for PSYNC reply */
 /* --- End of handshake states --- */
 #define REPL_STATE_TRANSFER 14 /* Receiving .rdb from master */
-#define REPL_STATE_CONNECTED 15 /* Connected to master */
+/*==========for swap_mode start==============*/
+#define REPL_STATE_TRANSFER_END 15
+/*==========for swap_mode end  ==============*/
+#define REPL_STATE_CONNECTED 16 /* Connected to master */
+/* if this instance is a slave, this indicates the status of
+ * SSDB receive snapshot */
+#define REPL_STATE_TRANSFER_SSDB_SNAPSHOT 17
+#define REPL_STATE_TRANSFER_SSDB_SNAPSHOT_END 18
+
 
 /* State of slaves from the POV of the master. Used in client->replstate.
  * In SEND_BULK and ONLINE state the slave receives new updates
@@ -297,8 +386,26 @@ typedef long long mstime_t; /* millisecond time type. */
  * to start the next background saving in order to send updates to it. */
 #define SLAVE_STATE_WAIT_BGSAVE_START 6 /* We need to produce a new RDB file. */
 #define SLAVE_STATE_WAIT_BGSAVE_END 7 /* Waiting RDB file creation to finish. */
-#define SLAVE_STATE_SEND_BULK 8 /* Sending RDB file to slave. */
-#define SLAVE_STATE_ONLINE 9 /* RDB file transmitted, sending just updates. */
+#define SLAVE_STATE_SEND_BULK 8 /* Sending RDB file to slave. but for swap_mode, this
+ * indicates RDB file is ready and we can send RDB. */
+#define SLAVE_STATE_SEND_BULK_FINISHED 9 /* for swap mode only, Finish sending RDB file to slave. */
+#define SLAVE_STATE_ONLINE 10 /* RDB file transmitted, sending just updates. */
+
+/* Use by server.ssdb_status(master) and client.ssdb_status(slave). */
+#define SSDB_NONE 0
+/* Master state of SSDB. */
+#define MASTER_SSDB_SNAPSHOT_WAIT_FLUSHALL 1
+#define MASTER_SSDB_SNAPSHOT_CHECK_WRITE 2
+#define MASTER_SSDB_SNAPSHOT_PRE 3
+#define MASTER_SSDB_SNAPSHOT_OK 4
+
+/* Slave state of SSDB. */
+#define SLAVE_SSDB_SNAPSHOT_WAIT_FLUSHALL 5
+#define SLAVE_SSDB_SNAPSHOT_IN_PROCESS 6
+#define SLAVE_SSDB_SNAPSHOT_TRANSFER_PRE 7
+#define SLAVE_SSDB_SNAPSHOT_TRANSFER_START 8
+#define SLAVE_SSDB_SNAPSHOT_TRANSFER_END 9
+
 
 /* Slave capabilities. */
 #define SLAVE_CAPA_NONE 0
@@ -376,7 +483,7 @@ typedef long long mstime_t; /* millisecond time type. */
 #define MAXMEMORY_ALLKEYS_LRU ((4<<8)|MAXMEMORY_FLAG_LRU|MAXMEMORY_FLAG_ALLKEYS)
 #define MAXMEMORY_ALLKEYS_LFU ((5<<8)|MAXMEMORY_FLAG_LFU|MAXMEMORY_FLAG_ALLKEYS)
 #define MAXMEMORY_ALLKEYS_RANDOM ((6<<8)|MAXMEMORY_FLAG_ALLKEYS)
-#define MAXMEMORY_NO_EVICTION (7<<8)
+#define MAXMEMORY_NO_EVICTION ((7<<8)|MAXMEMORY_FLAG_LFU)
 
 #define CONFIG_DEFAULT_MAXMEMORY_POLICY MAXMEMORY_NO_EVICTION
 
@@ -613,6 +720,19 @@ typedef struct redisDb {
     dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP)*/
     dict *ready_keys;           /* Blocked keys that received a PUSH */
     dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
+
+    dict *ssdb_blocking_keys;   /* For swap_mode: Keys in loading/tranferring/delete_confirm state
+                                   from/to SSDB. */
+    dict *ssdb_ready_keys;      /* For swap_mode: Blocked keys that ssdb load/transfer ok. */
+    dict *blocking_keys_write_same_ssdbkey; /* For swap_mode: Blocked keys that some clients are
+                                             * blocked by another write on the same ssdb key */
+    dict *transferring_keys;    /* Keys are in the process of transferring keys to SSDB. */
+    dict *loading_hot_keys;     /* keys become hot and in loading state from SSDB. */
+    dict *visiting_ssdb_keys;   /* Keys are visiting SSDB, including reading and writing. */
+    dict *delete_confirm_keys;  /* need to confirm whether keys are deleted in SSDB when receive
+                                 * 'check 1' responses for get like APIs or hdel like APIs. */
+    dict *migrating_ssdb_keys;  /* For swap-mode: record the migrating keys in ssdb. */
+    dict *ssdb_keys_to_clean;  /* For swap-mode: these keys are expired or evicted and need to tell ssdb to delete them. */
     int id;                     /* Database ID */
     long long avg_ttl;          /* Average TTL, just for stats */
 } redisDb;
@@ -652,6 +772,11 @@ typedef struct blockingState {
     void *module_blocked_handle; /* RedisModuleBlockedClient structure.
                                     which is opaque for the Redis core, only
                                     handled in module.c. */
+    /* BLOCKED_SSDB_LOADING_OR_TRANSFER */
+    dict *loading_or_transfer_keys; /* two cases:
+                                     * 1) The keys becomes hot and are loading from ssdb to redis.
+                                     * 2) The keys becomes cold and are transferring to ssdb. */
+
 } blockingState;
 
 /* The following structure represents a node in the server.ready_keys list,
@@ -724,9 +849,27 @@ typedef struct client {
     sds peerid;             /* Cached peer ID. */
 
     /* Response buffer */
-    int bufpos;
+    int bufpos;             /* the used lenth of buf. */
     char buf[PROTO_REPLY_CHUNK_BYTES];
+
+    redisContext *context;  /* Used by redis client in swap-mode. */
+    int ssdb_conn_flags;
+    char ssdb_status; /* Record the ssdb state. */
+
+    /* use this time to judge whether 'transfer snapshot' is timeout, if timeout,
+     * we can disconnect the slave. */
+    time_t transfer_snapshot_last_keepalive_time;
+    char client_ip[NET_IP_STR_LEN]; /* Used by customized-replication in swap-mode. */
+    redisReply *ssdb_replies[2]; /* Pointers for ssdb replies. */
+    long long repl_timer_id; /* the timer event id which is used to delete the timer event. */
+    int revert_len; /* save the length we have feed to c->buf or c->reply, we may need
+                     * to revert it from client buffer. */
+    int first_key_index;
+    long long visit_ssdb_start;
 } client;
+
+#define TYPE_TRANSFER_TO_SSDB 999
+#define TYPE_LOAD_KEY_FORM_SSDB 888
 
 struct saveparam {
     time_t seconds;
@@ -752,7 +895,17 @@ struct sharedObjectsStruct {
     *integers[OBJ_SHARED_INTEGERS],
     *mbulkhdr[OBJ_SHARED_BULKHDR_LEN], /* "*<value>\r\n" */
     *bulkhdr[OBJ_SHARED_BULKHDR_LEN];  /* "$<value>\r\n" */
+
     sds minstring, maxstring;
+
+    /* swap-mode shared obj. */
+    robj *storecmdobj, *dumpcmdobj, *slavedelcmdobj, *rr_restoreobj;
+    /* swap-mdoe shared sds. */
+    sds checkwriteok, checkwritenok, makesnapshotok, makesnapshotnok,
+        transfersnapshotok, transfersnapshotnok, transfersnapshotfinished,
+        transfersnapshotunfinished, transfersnapshotcontinue, delsnapshotok,
+        delsnapshotnok, flushcheckok, flushchecknok, flushdoneok, flushdonenok,
+        repopidsetok;
 };
 
 /* ZSETs use a specialized version of Skiplists */
@@ -870,6 +1023,24 @@ struct clusterState;
 #define CHILD_INFO_TYPE_RDB 0
 #define CHILD_INFO_TYPE_AOF 1
 
+/* for slave redis, we save the write operations from our master, so we can re-send
+ * it to SSDB when SSDB restart. */
+struct ssdb_write_op {
+    time_t time;
+    int index;
+    struct redisCommand *cmd;
+    int argc;
+    robj** argv;
+};
+
+struct loadSSDBkeyRule {
+    int cycle_seconds; /* time cycle */
+    long long hits_threshold; /* the lowest hits threshold to load keys */
+
+    long long last_ssdb_hits_count;  /* save the ssdb hit count of last time */
+    time_t count_begin_time; /* begin time of this cycle */
+};
+
 struct redisServer {
     /* General */
     pid_t pid;                  /* Main process pid. */
@@ -878,6 +1049,8 @@ struct redisServer {
     char **exec_argv;           /* Executable argv vector (copy). */
     int hz;                     /* serverCron() calls frequency in hertz */
     redisDb *db;
+    dict *hot_keys;             /* dict of keys is to be loaded from SSDB to redis. */
+    dict *maybe_deleted_ssdb_keys;/* dict of keys that are maybe deleted in SSDB and need to confirm. */
     dict *commands;             /* Command table */
     dict *orig_commands;        /* Command table before command renaming. */
     aeEventLoop *el;
@@ -905,10 +1078,16 @@ struct redisServer {
     char *bindaddr[CONFIG_BINDADDR_MAX]; /* Addresses we should bind to */
     int bindaddr_count;         /* Number of addresses in server.bindaddr[] */
     char *unixsocket;           /* UNIX socket path */
+    char *ssdb_server_unixsocket; /* UNIX socket path for connecting to ssdb. */
     mode_t unixsocketperm;      /* UNIX socket permission */
     int ipfd[CONFIG_BINDADDR_MAX]; /* TCP socket file descriptors */
     int ipfd_count;             /* Used slots in ipfd[] */
     int sofd;                   /* Unix socket file descriptor */
+    client *ssdb_client;        /* client for ssdb_client_sofd. */
+    client *ssdb_replication_client;   /* client for interaction with SSDB in
+                                 * replication state. */
+    client *slave_ssdb_load_evict_client;
+    client *expired_delete_client; /* use this client to delete expired ssdb keys */
     int cfd[CONFIG_BINDADDR_MAX];/* Cluster bus listening socket */
     int cfd_count;              /* Used slots in cfd[] */
     list *clients;              /* List of active clients */
@@ -922,6 +1101,9 @@ struct redisServer {
     dict *migrate_cached_sockets;/* MIGRATE cached sockets */
     uint64_t next_client_id;    /* Next client unique ID. Incremental. */
     int protected_mode;         /* Don't accept external connections. */
+    int swap_mode;              /* Tag for using swap customized mode. */
+    int load_from_ssdb;         /* Option for supporting whether loading from SSDB. */
+    int use_customized_replication; /* Option for use customized replication. */
     /* RDB / AOF loading information */
     int loading;                /* We are loading data from disk if true */
     off_t loading_total_bytes;
@@ -931,13 +1113,15 @@ struct redisServer {
     /* Fast pointers to often looked up command */
     struct redisCommand *delCommand, *multiCommand, *lpushCommand, *lpopCommand,
                         *rpopCommand, *sremCommand, *execCommand, *expireCommand,
-                        *pexpireCommand;
+                        *pexpireCommand, *pexpireatCommand, *persistCommand, *setCommand,
+                        *restoreCommand, *flushallCommand, *dumpfromssdbCommand, *storetossdbCommand;
     /* Fields used only for stats */
     time_t stat_starttime;          /* Server start time */
     long long stat_numcommands;     /* Number of processed commands */
     long long stat_numconnections;  /* Number of connections received */
     long long stat_expiredkeys;     /* Number of expired keys */
     long long stat_evictedkeys;     /* Number of evicted keys (maxmemory) */
+    long long stat_ssdbkeys;        /* Number of transfered keys to SSDB */
     long long stat_keyspace_hits;   /* Number of successful lookups of keys */
     long long stat_keyspace_misses; /* Number of failed lookups of keys */
     long long stat_active_defrag_hits;      /* number of allocations moved */
@@ -949,6 +1133,7 @@ struct redisServer {
     double stat_fork_rate;          /* Fork rate in GB/sec. */
     long long stat_rejected_conn;   /* Clients rejected because of maxclients */
     long long stat_sync_full;       /* Number of full resyncs with slaves. */
+    long long stat_sync_full_ok;   /* Number of successful full resyncs with slaves only for swap mode. */
     long long stat_sync_partial_ok; /* Number of accepted PSYNC requests. */
     long long stat_sync_partial_err;/* Number of unaccepted PSYNC requests. */
     list *slowlog;                  /* SLOWLOG list of commands */
@@ -1086,6 +1271,9 @@ struct redisServer {
     client *cached_master; /* Cached master to be reused for PSYNC. */
     int repl_syncio_timeout; /* Timeout for synchronous I/O calls */
     int repl_state;          /* Replication status if the instance is a slave */
+    int ssdb_repl_state;     /* SSDB snapshot receive status if the instance is a slave */
+    time_t slave_ssdb_transfer_snapshot_keepalive; /* in swap_mode, slave ssdb will send keepalive
+                                                * message to its redis when transfer snapshot. */
     off_t repl_transfer_size; /* Size of RDB to read from master during sync. */
     off_t repl_transfer_read; /* Amount of RDB read from master during sync. */
     off_t repl_transfer_last_fsync_off; /* Offset when we fsync-ed last time. */
@@ -1116,14 +1304,22 @@ struct redisServer {
     /* Limits */
     unsigned int maxclients;            /* Max number of simultaneous clients */
     unsigned long long maxmemory;   /* Max number of memory bytes to use */
+    unsigned int ssdb_load_upper_limit; /* the upper threshold for load keys
+        from ssdb. valid range:[0,100]. ssdb_load_upper_limit must be greater
+        than ssdb_transfer_lower_limit. */
+    unsigned int ssdb_transfer_lower_limit; /* the lower threshold for transfer
+        keys to ssdb. valid range:[0,100]*/
     int maxmemory_policy;           /* Policy for key eviction */
     int maxmemory_samples;          /* Pricision of random sampling */
+    unsigned char datacenter_id;    /* Support multiple datacenter, datacenter id. */
     unsigned int lfu_log_factor;    /* LFU logarithmic counter factor. */
     unsigned int lfu_decay_time;    /* LFU counter decay factor. */
     /* Blocked clients */
     unsigned int bpop_blocked_clients; /* Number of clients blocked by lists */
     list *unblocked_clients; /* list of clients to unblock before next loop */
     list *ready_keys;        /* List of readyList structures for BLPOP & co */
+    list *ssdb_ready_keys;   /* list of readyList structures for ssdb keys
+                              * loading/transferring/delete_confirming. */
     /* Sort parameters - qsort_r() is only available under BSD so we
      * have to take this state global, in order to pass it to sortCompare() */
     int sort_desc;
@@ -1194,6 +1390,80 @@ struct redisServer {
     /* System hardware info */
     size_t system_memory_size;  /* Total memory in system as reported by OS */
 
+    /*=======================[BEGIN]for swap mode========================*/
+    int is_doing_flushall;
+    client* current_flushall_client;
+    int prohibit_ssdb_read_write;
+    list *ssdb_flushall_blocked_clients;
+    /* Check unprocessed read/write ops with SSDB when process flushall/flushdb. */
+    int flush_check_unresponse_num;
+    time_t flush_check_begin_time;
+
+    /* Forbbid sending the writing cmds to SSDB. */
+    int is_allow_ssdb_write;
+    list *no_writing_ssdb_blocked_clients;
+
+    int ssdb_status;
+    mstime_t ssdb_snapshot_timestamp;
+    time_t check_write_begin_time;
+    /* Calculate the num of unresponsed clients. */
+    int check_write_unresponse_num;
+
+    /* use this time to process 'ssdb make snapshot' timeout in replication if we
+     * don't receive response from SSDB. */
+    time_t make_snapshot_begin_time;
+
+    robj** load_evict_argv;
+    robj* load_evict_key_arg;
+
+    /* if this is true, we need try to send delete SSDB snapshot request til we
+     * receive "delete snapshot ok" response. */
+    int retry_del_snapshot;
+
+    char **ssdbargv;
+    size_t *ssdbargvlen;
+    dict *loadAndEvictCmdDict;
+    int cmdNotDone;
+    client *delete_confirm_client;
+    list *delayed_migrate_clients;
+    list *storetossdb_migrate_keys;
+
+    unsigned long long global_transfer_id;
+
+    /* for slave redis, we save ssdb write operations before receive responses from ssdb. */
+    time_t last_send_writeop_time;
+    int last_send_writeop_index;
+    list* ssdb_write_oplist;
+    long long writeop_mem_size;
+    int slave_failed_retry_interrupted;
+    int send_failed_write_after_unblock;
+    struct ssdb_write_op* blocked_write_op;
+
+    int ssdb_is_down;
+    /* when ssdb is down, record the time */
+    time_t ssdb_down_time;
+    int slave_ssdb_critical_err_cnt;
+    long long stat_keyspace_ssdb_hits;   /* Number of successful lookups of keys in SSDB. */
+
+    int client_visiting_ssdb_timeout;
+    int client_blocked_by_keys_timeout;
+    int client_blocked_by_flushall_timeout;
+    int client_blocked_by_migrate_dump_timeout;
+    int slave_blocked_by_flushall_timeout;
+    int client_blocked_by_migrate_timeout;
+    int client_blocked_by_replication_nowrite_timeout;
+
+    int master_transfer_ssdb_snapshot_timeout;
+    int slave_transfer_ssdb_snapshot_timeout;
+    int master_max_concurrent_loading_keys;
+    int master_max_concurrent_transferring_keys;
+    int slave_max_concurrent_ssdb_swap_count;
+    int slave_max_ssdb_swap_count_everytime;
+
+    int coldkey_filter_times_everytime;
+    int lowest_idle_val_of_cold_key;
+    /*=======================[END]for swap mode========================*/
+
     /* Mutexes used to protect atomic variables when atomic builtins are
      * not available. */
     pthread_mutex_t lruclock_mutex;
@@ -1222,6 +1492,13 @@ struct redisCommand {
     int lastkey;  /* The last argument that's a key */
     int keystep;  /* The step between first and last key */
     long long microseconds, calls;
+};
+
+struct expiretimeInfo {
+    redisCommandProc *proc;
+    int unit;
+    int base;
+    int time_arg_index;
 };
 
 struct redisFunctionSym {
@@ -1299,6 +1576,7 @@ extern dictType hashDictType;
 extern dictType replScriptCacheDictType;
 extern dictType keyptrDictType;
 extern dictType modulesDictType;
+extern dictType keyDictType;
 
 /*-----------------------------------------------------------------------------
  * Functions prototypes
@@ -1342,6 +1620,11 @@ void processInputBuffer(client *c);
 void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+void ssdbClientUnixHandler(aeEventLoop *el, int fd, void *private, int mask);
+int syncReadReply(redisContext *c, void **reply, long long timeout);
+int isSpecialConnection(client *c);
+client* createSpecialSSDBclient();
+void connectSepecialSSDBclients();
 void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask);
 void addReplyString(client *c, const char *s, size_t len);
 void addReplyBulk(client *c, robj *obj);
@@ -1383,6 +1666,16 @@ int clientsArePaused(void);
 int processEventsWhileBlocked(void);
 int handleClientsWithPendingWrites(void);
 int clientHasPendingReplies(client *c);
+int sendCommandToSSDB(client *c, sds finalcmd);
+int sendRepopidCheckToSSDB(client* c);
+int sendFailedRetryCommandToSSDB(client* c, sds finalcmd);
+int sendRepopidToSSDB(client* c, time_t op_time, int op_id, int is_slave_retry);
+int updateSendRepopidToSSDB(client* c);
+sds composeRedisCmd(int argc, const char **argv, const size_t *argvlen);
+sds composeCmdFromArgs(int argc, robj** obj_argv);
+int nonBlockConnectToSsdbServer(client *c);
+void sendCheckWriteCommandToSSDB(aeEventLoop *el, int fd, void *privdata, int mask);
+void sendFlushCheckCommandToSSDB(aeEventLoop *el, int fd, void *privdata, int mask);
 void unlinkClient(client *c);
 int writeToClient(int fd, client *c, int handler_installed);
 
@@ -1413,6 +1706,9 @@ void unblockClientWaitingData(client *c);
 void handleClientsBlockedOnLists(void);
 void popGenericCommand(client *c, int where);
 void signalListAsReady(redisDb *db, robj *key);
+client* removeFirstClientFromListForBlockedKey(dict* blocked_dict, robj* key);
+void removeBlockedKeysFromTransferOrLoadingKeys(client *c);
+void transferringOrLoadingBlockedClientTimeOut(client *c);
 
 /* MULTI/EXEC/WATCH... */
 void unwatchAllKeys(client *c);
@@ -1505,6 +1801,10 @@ void clearReplicationId2(void);
 void chopReplicationBacklog(void);
 void replicationCacheMasterUsingMyself(void);
 void feedReplicationBacklog(void *ptr, size_t len);
+void abortCustomizedReplication();
+void resetCustomizedReplication();
+void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask);
+void freeMultiCmd(multiCmd *md);
 
 /* Generic persistence functions */
 void startLoading(FILE *fp);
@@ -1584,6 +1884,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore);
 long zsetRank(robj *zobj, sds ele, int reverse);
 int zsetDel(robj *zobj, sds ele);
 sds ziplistGetObject(unsigned char *sptr);
+void ziplistRepr(unsigned char *zl);
 int zslValueGteMin(double value, zrangespec *spec);
 int zslValueLteMax(double value, zrangespec *spec);
 void zslFreeLexRange(zlexrangespec *spec);
@@ -1599,13 +1900,46 @@ int zslLexValueLteMax(sds value, zlexrangespec *spec);
 
 /* Core functions */
 int freeMemoryIfNeeded(void);
+void removeSuccessWriteop(time_t last_success_time, int last_success_index);
+int confirmAndRetrySlaveSSDBwriteOp(client* master, time_t time, int index);
+void emptySlaveSSDBwriteOperations();
+void freeSSDBwriteOp(struct ssdb_write_op* op);
+void cleanSpecialClientsAndIntermediateKeys(int is_flushall);
+void cleanAndSignalHotKeys();
+void cleanAndSignalDeleteConfirmKeys();
+void cleanAndSignalLoadingOrTransferringKeys();
+void emptyEvictionPool();
+void signalBlockingKeyAsReady(redisDb *db, robj* key);
+int blockForLoadingkeys(client *c, struct redisCommand* cmd, robj **keys, int numkeys, mstime_t timeout);
+void handleClientsBlockedOnSSDB(void);
+void handleClientsBlockedOnCustomizedPsync(void);
+void handleClientsBlockedOnFlushall(void);
+void handleClientsBlockedOnMigrate(void);
+void handleLoadAndEvictCmdInSlave(void);
+void prepareSSDBreplication(client* slave);
+int tryEvictingKeysToSSDB(size_t *mem_tofree);
+size_t objectComputeSize(robj *o, size_t sample_size);
+size_t estimateKeyMemoryUsage(dictEntry *de);
 int processCommand(client *c);
+int runCommandReplicationConn(client *c, listNode* writeop_ln);
+long long getAbsoluteExpireTimeFromArgs(robj** argv, int argc, struct redisCommand* cmd);
+int runCommand(client *c);
+int checkValidCommand(client* c);
+int checkKeysInMediateState(client* c);
+int checkKeysForMigrate(client *c);
+int processCommandReplicationConn(client* c, struct ssdb_write_op* slave_retry_write);
+int processCommandMaybeInSSDB(client *c);
+int isMigratingSSDBKey(sds keysds);
+int addMigratingSSDBKey(sds keysds);
+int delMigratingSSDBKey(sds keysds);
+int isSSDBrespCmd(struct redisCommand *cmd);
 void setupSignalHandlers(void);
 struct redisCommand *lookupCommand(sds name);
 struct redisCommand *lookupCommandByCString(char *s);
 struct redisCommand *lookupCommandOrOriginal(sds name);
 void call(client *c, int flags);
 void propagate(struct redisCommand *cmd, int dbid, robj **argv, int argc, int flags);
+void propagateCmdHandledBySSDB(client *c);
 void alsoPropagate(struct redisCommand *cmd, int dbid, robj **argv, int argc, int target);
 void forceCommandPropagation(client *c, int flags);
 void preventCommandPropagation(client *c);
@@ -1635,6 +1969,9 @@ unsigned int LRU_CLOCK(void);
 const char *evictPolicyToString(void);
 struct redisMemOverhead *getMemoryOverheadData(void);
 void freeMemoryOverheadData(struct redisMemOverhead *mh);
+
+#define EVICTED_DATA_DBID (server.dbnum - 1)
+#define EVICTED_DATA_DB (server.db + server.dbnum - 1)
 
 #define RESTART_SERVER_NONE 0
 #define RESTART_SERVER_GRACEFULLY (1<<0)     /* Do proper shutdown. */
@@ -1705,6 +2042,8 @@ int removeExpire(redisDb *db, robj *key);
 void propagateExpire(redisDb *db, robj *key, int lazy);
 int expireIfNeeded(redisDb *db, robj *key);
 long long getExpire(redisDb *db, robj *key);
+void setTransferringDB(redisDb *db, robj *key, unsigned long long id);
+void setLoadingDB(robj *key, unsigned long long id);
 void setExpire(client *c, redisDb *db, robj *key, long long when);
 robj *lookupKey(redisDb *db, robj *key, int flags);
 robj *lookupKeyRead(redisDb *db, robj *key);
@@ -1786,12 +2125,14 @@ int ldbPendingChildren(void);
 void processUnblockedClients(void);
 void blockClient(client *c, int btype);
 void unblockClient(client *c);
-void replyToBlockedClientTimedOut(client *c);
+int replyToBlockedClientTimedOut(client *c);
 int getTimeoutFromObjectOrReply(client *c, robj *object, mstime_t *timeout, int unit);
 void disconnectAllBlockedClients(void);
 
 /* expire.c -- Handling of expired keys */
 void activeExpireCycle(int type);
+/* expire.c -- Handling of evicting keys to SSDB. */
+int epilogOfEvictingToSSDB(robj *keyobj);
 void expireSlaveKeys(void);
 void rememberSlaveKeyWithExpire(redisDb *db, robj *key);
 void flushSlaveKeysWithExpireList(void);
@@ -1802,11 +2143,13 @@ void evictionPoolAlloc(void);
 #define LFU_INIT_VAL 5
 unsigned long LFUGetTimeInMinutes(void);
 uint8_t LFULogIncr(uint8_t value);
+unsigned long KeyLFUDecrAndReturn(sds key);
 
 /* Keys hashing / comparison functions for dict.c hash tables. */
 uint64_t dictSdsHash(const void *key);
 int dictSdsKeyCompare(void *privdata, const void *key1, const void *key2);
 void dictSdsDestructor(void *privdata, void *val);
+void *dictSdsDup(void *privdata, const void *val);
 
 /* Git SHA1 */
 char *redisGitSHA1(void);
@@ -1884,6 +2227,7 @@ void sortCommand(client *c);
 void lremCommand(client *c);
 void rpoplpushCommand(client *c);
 void infoCommand(client *c);
+void listLoadingKeysCommand(client* c);
 void mgetCommand(client *c);
 void monitorCommand(client *c);
 void expireCommand(client *c);
@@ -1990,6 +2334,43 @@ void pfdebugCommand(client *c);
 void latencyCommand(client *c);
 void moduleCommand(client *c);
 void securityWarningCommand(client *c);
+void ssdbRespDelCommand(client *c);
+void ssdbRespRestoreCommand(client *c);
+void ssdbRespFailCommand(client *c);
+void ssdbRespNotfoundCommand(client *c);
+void ssdbNotifyCommand(client* c);
+void storetossdbCommand(client *c);
+void locatekeyCommand(client *c);
+/* for test purpose only */
+void setlfuCommand(client *c);
+void slaveDelCommand(client *c);
+void dumpfromssdbCommand(client *c);
+int prologOfEvictingToSSDB(robj *keyobj, redisDb *db);
+int prologOfLoadingFromSSDB(client* c, robj *keyobj);
+int removeVisitingSSDBKey(struct redisCommand *cmd, int argc, robj** argv);
+void handleCustomizedBlockedClients();
+int tryBlockingClient(client *c);
+int handleResponseOfMigrateDump(client *c);
+void addClientToListForBlockedKey(client *c, struct redisCommand* cmd, dict* blocked_dict, robj* keyobj);
+void removeClientFromListForBlockedKey(client* c, dict* blocked_dict, robj* key);
+void sendDelSSDBsnapshot();
+int handleResponseTimeoutOfTransferSnapshot(struct aeEventLoop *eventLoop, long long id, void *clientData);
+void doSSDBflushIfCheckDone();
+void makeSSDBsnapshotIfCheckOK();
+void loadThisKeyImmediately(sds key);
+void updateSlaveSSDBwriteIndex();
+int updateSendRepopidToSSDB(client* c);
+void saveSlaveSSDBwriteOp(client *c, time_t time, int index);
+void unblockClientWritingOnSameKey(robj* keyobj);
+int closeAndReconnectSSDBconnection(client* c);
+
+void processInputBufferOfMaster(client* c);
+
+void replaceKeyInHotPool(sds key, int dbid, unsigned long long idle);
+void tryInsertColdPool(struct evictionPoolEntry *pool, sds key, int dbid, unsigned long long idle);
+
+#define COLD_POOL_TYPE 1
+#define HOT_POOL_TYPE 2
 
 #if defined(__GNUC__)
 void *calloc(size_t count, size_t size) __attribute__ ((deprecated));
@@ -2018,5 +2399,37 @@ void xorDigest(unsigned char *digest, void *ptr, size_t len);
     printf("DEBUG %s:%d > " fmt "\n", __FILE__, __LINE__, __VA_ARGS__)
 #define redisDebugMark() \
     printf("-- MARK %s:%d --\n", __FILE__, __LINE__)
+
+int checkBeforeExpire(redisDb *db, robj *key);
+int isThisKeyVisitingWriteSSDB(sds key);
+
+#define dictGetVisitingSSDBwriteCount(he) ((he)->v.visiting_ssdb.wcnt)
+#define dictGetVisitingSSDBreadCount(he) ((he)->v.visiting_ssdb.rcnt)
+#define dictSetVisitingSSDBwriteCount(entry, _val_) \
+    do { (entry)->v.visiting_ssdb.wcnt = _val_; } while(0)
+#define dictSetVisitingSSDBreadCount(entry, _val_) \
+    do { (entry)->v.visiting_ssdb.rcnt = _val_; } while(0)
+
+/* for slave redis, after we complete RDB receiving, we wait
+ * for my SSDB to send ssdb transfer message to me. if timeout,
+ * cancel replication handshake this time. */
+#define SLAVE_SSDB_TRANSFER_SNAPSHOT_TIMEOUT 30
+
+/* SSDB send "rr_transfer_snapshot continue" every 5 seconds,
+ * we use a larger timeout as the timeout interval.*/
+#define MASTER_TRANSFER_SSDB_SNAPSHOT_TIMEOUT 30
+
+/* config options for swap mode */
+#define MASTER_MAX_CONCURRENT_LOADING_KEYS 5
+#define MASTER_MAX_CONCURRENT_TRANSFERRING_KEYS 5
+
+#define SLAVE_MAX_CONCURRENT_SSDB_SWAP_COUNT 10
+#define SLAVE_MAX_SSDB_SWAP_COUNT_EVERYTIME 2
+
+#define SLAVE_MAX_PROCESSED_CMD_NUM_EVERYTIME 20
+
+#define COLDKEY_FILTER_TIMES_EVERYTIME 5
+
+#define LOWEST_IDLE_VAL_OF_COLD_KEY (255-LFU_INIT_VAL+1)
 
 #endif

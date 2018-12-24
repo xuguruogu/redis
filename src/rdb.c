@@ -1479,7 +1479,8 @@ void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
          * our cached time since it is used to create and update the last
          * interaction time with clients and for other important things. */
         updateCachedTime();
-        if (server.masterhost && server.repl_state == REPL_STATE_TRANSFER)
+        if (server.masterhost && (server.repl_state == REPL_STATE_TRANSFER ||
+                (server.swap_mode && server.repl_state == REPL_STATE_TRANSFER_END)))
             replicationSendNewlineToMaster();
         loadingProgress(r->processed_bytes);
         processEventsWhileBlocked();
@@ -1542,7 +1543,7 @@ int rdbLoadRio(rio *rdb, rdbSaveInfo *rsi) {
             /* SELECTDB: Select the specified database. */
             if ((dbid = rdbLoadLen(rdb,NULL)) == RDB_LENERR)
                 goto eoferr;
-            if (dbid >= (unsigned)server.dbnum) {
+            if (dbid >= (uint64_t)server.dbnum) {
                 serverLog(LL_WARNING,
                     "FATAL: Data file was created with a Redis "
                     "server configured to handle more than %d "
@@ -2021,6 +2022,7 @@ void bgsaveCommand(client *c) {
 /* Populate the rdbSaveInfo structure used to persist the replication
  * information inside the RDB file. Currently the structure explicitly
  * contains just the currently selected DB from the master stream, however
+ * if the rdbSave*() family functions receive a NULL rsi structure also
  * if the rdbSave*() family functions receive a NULL rsi structure also
  * the Replication ID/offset is not saved. The function popultes 'rsi'
  * that is normally stack-allocated in the caller, returns the populated

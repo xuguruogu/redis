@@ -107,6 +107,7 @@ static struct config {
     char *pattern;
     char *rdb_filename;
     int bigkeys;
+    int dreply;
     int stdinarg; /* get last arg from stdin. (-x option) */
     char *auth;
     int output; /* output mode, see OUTPUT_* defines */
@@ -269,6 +270,14 @@ static void cliIntegrateHelp(void) {
     if (cliConnect(0) == REDIS_ERR) return;
 
     redisReply *reply = redisCommand(context, "COMMAND");
+
+    //R2M append reply patch
+    if (config.dreply == 1) {
+        void *reply2;
+        redisGetReply(context,&reply2);
+        freeReplyObject(reply2);
+    }
+
     if(reply == NULL || reply->type != REDIS_REPLY_ARRAY) return;
 
     /* Scan the array reported by COMMAND and fill only the entries that
@@ -844,7 +853,7 @@ static int cliSendCommand(int argc, char **argv, int repeat) {
     if (context == NULL) return REDIS_ERR;
 
     output_raw = 0;
-    if (!strcasecmp(command,"info") ||
+    if (!strcasecmp(command,"info") || !strcasecmp(command,"listloadingkeys") ||
         (argc >= 2 && !strcasecmp(command,"debug") &&
                        !strcasecmp(argv[1],"htstats")) ||
         (argc >= 2 && !strcasecmp(command,"memory") &&
@@ -928,6 +937,14 @@ static int cliSendCommand(int argc, char **argv, int repeat) {
                 cliSelect();
             }
         }
+
+        //R2M append reply patch
+        if (config.dreply == 1) {
+            if (cliReadReply(output_raw) != REDIS_OK) {
+                return REDIS_ERR;
+            }
+        }
+
         if (config.interval) usleep(config.interval);
         fflush(stdout); /* Make it grep friendly */
     }
@@ -989,6 +1006,8 @@ static int parseOptions(int argc, char **argv) {
             usage();
         } else if (!strcmp(argv[i],"-x")) {
             config.stdinarg = 1;
+        } else if (!strcmp(argv[i],"-dreply")) {
+            config.dreply = 1;
         } else if (!strcmp(argv[i],"-p") && !lastarg) {
             config.hostport = atoi(argv[++i]);
         } else if (!strcmp(argv[i],"-s") && !lastarg) {
@@ -1116,6 +1135,7 @@ static void usage(void) {
 "  -x                 Read last argument from STDIN.\n"
 "  -d <delimiter>     Multi-bulk delimiter in for raw formatting (default: \\n).\n"
 "  -c                 Enable cluster mode (follow -ASK and -MOVED redirections).\n"
+"  -dreply           Enable append reply mode (r2m patched).\n"
 "  --raw              Use raw formatting for replies (default when STDOUT is\n"
 "                     not a tty).\n"
 "  --no-raw           Force formatted output even when STDOUT is not a tty.\n"
@@ -1864,7 +1884,7 @@ static void pipeMode(void) {
 
             /* Consume replies. */
             do {
-                if (redisReaderGetReply(reader,(void**)&reply) == REDIS_ERR) {
+                if (redisReaderGetReply(reader,(void**)&reply, NULL, 0) == REDIS_ERR) {
                     fprintf(stderr, "Error reading replies from server\n");
                     exit(1);
                 }
@@ -2630,6 +2650,7 @@ int main(int argc, char **argv) {
     config.pipe_mode = 0;
     config.pipe_timeout = REDIS_CLI_DEFAULT_PIPE_TIMEOUT;
     config.bigkeys = 0;
+    config.dreply = 0;
     config.stdinarg = 0;
     config.auth = NULL;
     config.eval = NULL;

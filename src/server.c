@@ -123,100 +123,107 @@ volatile unsigned long lru_clock; /* Server global current LRU time. */
  *    its execution as long as the kernel scheduler is giving us time.
  *    Note that commands that may trigger a DEL as a side effect (like SET)
  *    are not fast commands.
+ * J: For swap mode and commands with read/write flag only, this indicates SSDB
+ *    can process this command and we can transfer this command to SSDB.
+ * j: For swap mode and commands with read/write flag only, this indicates redis
+ *    can process this command but SSDB can't and we can't transfer this command
+ *    to SSDB.
+ * n: In swap mode, commands are not allowed.
  */
 struct redisCommand redisCommandTable[] = {
-    {"module",moduleCommand,-2,"as",0,NULL,1,1,1,0,0},
-    {"get",getCommand,2,"rF",0,NULL,1,1,1,0,0},
-    {"set",setCommand,-3,"wm",0,NULL,1,1,1,0,0},
-    {"setnx",setnxCommand,3,"wmF",0,NULL,1,1,1,0,0},
-    {"setex",setexCommand,4,"wm",0,NULL,1,1,1,0,0},
-    {"psetex",psetexCommand,4,"wm",0,NULL,1,1,1,0,0},
-    {"append",appendCommand,3,"wm",0,NULL,1,1,1,0,0},
-    {"strlen",strlenCommand,2,"rF",0,NULL,1,1,1,0,0},
-    {"del",delCommand,-2,"w",0,NULL,1,-1,1,0,0},
-    {"unlink",unlinkCommand,-2,"wF",0,NULL,1,-1,1,0,0},
-    {"exists",existsCommand,-2,"rF",0,NULL,1,-1,1,0,0},
-    {"setbit",setbitCommand,4,"wm",0,NULL,1,1,1,0,0},
-    {"getbit",getbitCommand,3,"rF",0,NULL,1,1,1,0,0},
+    {"module",moduleCommand,-2,"asn",0,NULL,1,1,1,0,0},
+    {"get",getCommand,2,"rFJ",0,NULL,1,1,1,0,0},
+    {"set",setCommand,-3,"wmJ",0,NULL,1,1,1,0,0},
+    {"setnx",setnxCommand,3,"wmFJ",0,NULL,1,1,1,0,0},
+    {"setex",setexCommand,4,"wmJ",0,NULL,1,1,1,0,0},
+    {"psetex",psetexCommand,4,"wmJ",0,NULL,1,1,1,0,0},
+    {"append",appendCommand,3,"wmJ",0,NULL,1,1,1,0,0},
+    {"strlen",strlenCommand,2,"rFJ",0,NULL,1,1,1,0,0},
+    /* in swap mode, we only support one key command */
+    {"del",delCommand,2,"wJ",0,NULL,1,1,1,0,0},
+    {"unlink",unlinkCommand,2,"wF",0,NULL,1,1,1,0,0},
+    {"exists",existsCommand,2,"rFJ",0,NULL,1,1,1,0,0},
+    {"setbit",setbitCommand,4,"wmJ",0,NULL,1,1,1,0,0},
+    {"getbit",getbitCommand,3,"rFJ",0,NULL,1,1,1,0,0},
     {"bitfield",bitfieldCommand,-2,"wm",0,NULL,1,1,1,0,0},
-    {"setrange",setrangeCommand,4,"wm",0,NULL,1,1,1,0,0},
-    {"getrange",getrangeCommand,4,"r",0,NULL,1,1,1,0,0},
-    {"substr",getrangeCommand,4,"r",0,NULL,1,1,1,0,0},
-    {"incr",incrCommand,2,"wmF",0,NULL,1,1,1,0,0},
-    {"decr",decrCommand,2,"wmF",0,NULL,1,1,1,0,0},
+    {"setrange",setrangeCommand,4,"wmJ",0,NULL,1,1,1,0,0},
+    {"getrange",getrangeCommand,4,"rJ",0,NULL,1,1,1,0,0},
+    {"substr",getrangeCommand,4,"rJ",0,NULL,1,1,1,0,0},
+    {"incr",incrCommand,2,"wmFJ",0,NULL,1,1,1,0,0},
+    {"decr",decrCommand,2,"wmFJ",0,NULL,1,1,1,0,0},
     {"mget",mgetCommand,-2,"rF",0,NULL,1,-1,1,0,0},
-    {"rpush",rpushCommand,-3,"wmF",0,NULL,1,1,1,0,0},
-    {"lpush",lpushCommand,-3,"wmF",0,NULL,1,1,1,0,0},
-    {"rpushx",rpushxCommand,-3,"wmF",0,NULL,1,1,1,0,0},
-    {"lpushx",lpushxCommand,-3,"wmF",0,NULL,1,1,1,0,0},
+    {"rpush",rpushCommand,-3,"wmFJ",0,NULL,1,1,1,0,0},
+    {"lpush",lpushCommand,-3,"wmFJ",0,NULL,1,1,1,0,0},
+    {"rpushx",rpushxCommand,-3,"wmFJ",0,NULL,1,1,1,0,0},
+    {"lpushx",lpushxCommand,-3,"wmFJ",0,NULL,1,1,1,0,0},
     {"linsert",linsertCommand,5,"wm",0,NULL,1,1,1,0,0},
-    {"rpop",rpopCommand,2,"wF",0,NULL,1,1,1,0,0},
-    {"lpop",lpopCommand,2,"wF",0,NULL,1,1,1,0,0},
+    {"rpop",rpopCommand,2,"wFJ",0,NULL,1,1,1,0,0},
+    {"lpop",lpopCommand,2,"wFJ",0,NULL,1,1,1,0,0},
     {"brpop",brpopCommand,-3,"ws",0,NULL,1,-2,1,0,0},
     {"brpoplpush",brpoplpushCommand,4,"wms",0,NULL,1,2,1,0,0},
     {"blpop",blpopCommand,-3,"ws",0,NULL,1,-2,1,0,0},
-    {"llen",llenCommand,2,"rF",0,NULL,1,1,1,0,0},
-    {"lindex",lindexCommand,3,"r",0,NULL,1,1,1,0,0},
-    {"lset",lsetCommand,4,"wm",0,NULL,1,1,1,0,0},
-    {"lrange",lrangeCommand,4,"r",0,NULL,1,1,1,0,0},
-    {"ltrim",ltrimCommand,4,"w",0,NULL,1,1,1,0,0},
+    {"llen",llenCommand,2,"rFJ",0,NULL,1,1,1,0,0},
+    {"lindex",lindexCommand,3,"rJ",0,NULL,1,1,1,0,0},
+    {"lset",lsetCommand,4,"wmJ",0,NULL,1,1,1,0,0},
+    {"lrange",lrangeCommand,4,"rJ",0,NULL,1,1,1,0,0},
+    {"ltrim",ltrimCommand,4,"wJ",0,NULL,1,1,1,0,0},
     {"lrem",lremCommand,4,"w",0,NULL,1,1,1,0,0},
     {"rpoplpush",rpoplpushCommand,3,"wm",0,NULL,1,2,1,0,0},
-    {"sadd",saddCommand,-3,"wmF",0,NULL,1,1,1,0,0},
-    {"srem",sremCommand,-3,"wF",0,NULL,1,1,1,0,0},
+    {"sadd",saddCommand,-3,"wmFJ",0,NULL,1,1,1,0,0},
+    {"srem",sremCommand,-3,"wFJ",0,NULL,1,1,1,0,0},
     {"smove",smoveCommand,4,"wF",0,NULL,1,2,1,0,0},
-    {"sismember",sismemberCommand,3,"rF",0,NULL,1,1,1,0,0},
-    {"scard",scardCommand,2,"rF",0,NULL,1,1,1,0,0},
-    {"spop",spopCommand,-2,"wRF",0,NULL,1,1,1,0,0},
-    {"srandmember",srandmemberCommand,-2,"rR",0,NULL,1,1,1,0,0},
+    {"sismember",sismemberCommand,3,"rFJ",0,NULL,1,1,1,0,0},
+    {"scard",scardCommand,2,"rFJ",0,NULL,1,1,1,0,0},
+    {"spop",spopCommand,-2,"wRFJ",0,NULL,1,1,1,0,0},
+    {"srandmember",srandmemberCommand,-2,"rRJ",0,NULL,1,1,1,0,0},
     {"sinter",sinterCommand,-2,"rS",0,NULL,1,-1,1,0,0},
     {"sinterstore",sinterstoreCommand,-3,"wm",0,NULL,1,-1,1,0,0},
     {"sunion",sunionCommand,-2,"rS",0,NULL,1,-1,1,0,0},
     {"sunionstore",sunionstoreCommand,-3,"wm",0,NULL,1,-1,1,0,0},
     {"sdiff",sdiffCommand,-2,"rS",0,NULL,1,-1,1,0,0},
     {"sdiffstore",sdiffstoreCommand,-3,"wm",0,NULL,1,-1,1,0,0},
-    {"smembers",sinterCommand,2,"rS",0,NULL,1,1,1,0,0},
+    {"smembers",sinterCommand,2,"rSJ",0,NULL,1,1,1,0,0},
     {"sscan",sscanCommand,-3,"rR",0,NULL,1,1,1,0,0},
-    {"zadd",zaddCommand,-4,"wmF",0,NULL,1,1,1,0,0},
-    {"zincrby",zincrbyCommand,4,"wmF",0,NULL,1,1,1,0,0},
-    {"zrem",zremCommand,-3,"wF",0,NULL,1,1,1,0,0},
-    {"zremrangebyscore",zremrangebyscoreCommand,4,"w",0,NULL,1,1,1,0,0},
-    {"zremrangebyrank",zremrangebyrankCommand,4,"w",0,NULL,1,1,1,0,0},
-    {"zremrangebylex",zremrangebylexCommand,4,"w",0,NULL,1,1,1,0,0},
+    {"zadd",zaddCommand,-4,"wmFJ",0,NULL,1,1,1,0,0},
+    {"zincrby",zincrbyCommand,4,"wmFJ",0,NULL,1,1,1,0,0},
+    {"zrem",zremCommand,-3,"wFJ",0,NULL,1,1,1,0,0},
+    {"zremrangebyscore",zremrangebyscoreCommand,4,"wJ",0,NULL,1,1,1,0,0},
+    {"zremrangebyrank",zremrangebyrankCommand,4,"wJ",0,NULL,1,1,1,0,0},
+    {"zremrangebylex",zremrangebylexCommand,4,"wJ",0,NULL,1,1,1,0,0},
     {"zunionstore",zunionstoreCommand,-4,"wm",0,zunionInterGetKeys,0,0,0,0,0},
     {"zinterstore",zinterstoreCommand,-4,"wm",0,zunionInterGetKeys,0,0,0,0,0},
-    {"zrange",zrangeCommand,-4,"r",0,NULL,1,1,1,0,0},
-    {"zrangebyscore",zrangebyscoreCommand,-4,"r",0,NULL,1,1,1,0,0},
-    {"zrevrangebyscore",zrevrangebyscoreCommand,-4,"r",0,NULL,1,1,1,0,0},
-    {"zrangebylex",zrangebylexCommand,-4,"r",0,NULL,1,1,1,0,0},
-    {"zrevrangebylex",zrevrangebylexCommand,-4,"r",0,NULL,1,1,1,0,0},
-    {"zcount",zcountCommand,4,"rF",0,NULL,1,1,1,0,0},
-    {"zlexcount",zlexcountCommand,4,"rF",0,NULL,1,1,1,0,0},
-    {"zrevrange",zrevrangeCommand,-4,"r",0,NULL,1,1,1,0,0},
-    {"zcard",zcardCommand,2,"rF",0,NULL,1,1,1,0,0},
-    {"zscore",zscoreCommand,3,"rF",0,NULL,1,1,1,0,0},
-    {"zrank",zrankCommand,3,"rF",0,NULL,1,1,1,0,0},
-    {"zrevrank",zrevrankCommand,3,"rF",0,NULL,1,1,1,0,0},
+    {"zrange",zrangeCommand,-4,"rJ",0,NULL,1,1,1,0,0},
+    {"zrangebyscore",zrangebyscoreCommand,-4,"rJ",0,NULL,1,1,1,0,0},
+    {"zrevrangebyscore",zrevrangebyscoreCommand,-4,"rJ",0,NULL,1,1,1,0,0},
+    {"zrangebylex",zrangebylexCommand,-4,"rJ",0,NULL,1,1,1,0,0},
+    {"zrevrangebylex",zrevrangebylexCommand,-4,"rJ",0,NULL,1,1,1,0,0},
+    {"zcount",zcountCommand,4,"rFJ",0,NULL,1,1,1,0,0},
+    {"zlexcount",zlexcountCommand,4,"rFJ",0,NULL,1,1,1,0,0},
+    {"zrevrange",zrevrangeCommand,-4,"rJ",0,NULL,1,1,1,0,0},
+    {"zcard",zcardCommand,2,"rFJ",0,NULL,1,1,1,0,0},
+    {"zscore",zscoreCommand,3,"rFJ",0,NULL,1,1,1,0,0},
+    {"zrank",zrankCommand,3,"rFJ",0,NULL,1,1,1,0,0},
+    {"zrevrank",zrevrankCommand,3,"rFJ",0,NULL,1,1,1,0,0},
     {"zscan",zscanCommand,-3,"rR",0,NULL,1,1,1,0,0},
-    {"hset",hsetCommand,-4,"wmF",0,NULL,1,1,1,0,0},
-    {"hsetnx",hsetnxCommand,4,"wmF",0,NULL,1,1,1,0,0},
-    {"hget",hgetCommand,3,"rF",0,NULL,1,1,1,0,0},
-    {"hmset",hsetCommand,-4,"wmF",0,NULL,1,1,1,0,0},
-    {"hmget",hmgetCommand,-3,"rF",0,NULL,1,1,1,0,0},
-    {"hincrby",hincrbyCommand,4,"wmF",0,NULL,1,1,1,0,0},
-    {"hincrbyfloat",hincrbyfloatCommand,4,"wmF",0,NULL,1,1,1,0,0},
-    {"hdel",hdelCommand,-3,"wF",0,NULL,1,1,1,0,0},
-    {"hlen",hlenCommand,2,"rF",0,NULL,1,1,1,0,0},
-    {"hstrlen",hstrlenCommand,3,"rF",0,NULL,1,1,1,0,0},
-    {"hkeys",hkeysCommand,2,"rS",0,NULL,1,1,1,0,0},
-    {"hvals",hvalsCommand,2,"rS",0,NULL,1,1,1,0,0},
-    {"hgetall",hgetallCommand,2,"r",0,NULL,1,1,1,0,0},
-    {"hexists",hexistsCommand,3,"rF",0,NULL,1,1,1,0,0},
-    {"hscan",hscanCommand,-3,"rR",0,NULL,1,1,1,0,0},
-    {"incrby",incrbyCommand,3,"wmF",0,NULL,1,1,1,0,0},
-    {"decrby",decrbyCommand,3,"wmF",0,NULL,1,1,1,0,0},
-    {"incrbyfloat",incrbyfloatCommand,3,"wmF",0,NULL,1,1,1,0,0},
-    {"getset",getsetCommand,3,"wm",0,NULL,1,1,1,0,0},
+    {"hset",hsetCommand,-4,"wmFJ",0,NULL,1,1,1,0,0},
+    {"hsetnx",hsetnxCommand,4,"wmFJ",0,NULL,1,1,1,0,0},
+    {"hget",hgetCommand,3,"rFJ",0,NULL,1,1,1,0,0},
+    {"hmset",hsetCommand,-4,"wmFJ",0,NULL,1,1,1,0,0},
+    {"hmget",hmgetCommand,-3,"rFJ",0,NULL,1,1,1,0,0},
+    {"hincrby",hincrbyCommand,4,"wmFJ",0,NULL,1,1,1,0,0},
+    {"hincrbyfloat",hincrbyfloatCommand,4,"wmFJ",0,NULL,1,1,1,0,0},
+    {"hdel",hdelCommand,-3,"wFJ",0,NULL,1,1,1,0,0},
+    {"hlen",hlenCommand,2,"rFJ",0,NULL,1,1,1,0,0},
+    {"hstrlen",hstrlenCommand,3,"rFJ",0,NULL,1,1,1,0,0},
+    {"hkeys",hkeysCommand,2,"rSJ",0,NULL,1,1,1,0,0},
+    {"hvals",hvalsCommand,2,"rSJ",0,NULL,1,1,1,0,0},
+    {"hgetall",hgetallCommand,2,"rJ",0,NULL,1,1,1,0,0},
+    {"hexists",hexistsCommand,3,"rFJ",0,NULL,1,1,1,0,0},
+    {"hscan",hscanCommand,-3,"rRJ",0,NULL,1,1,1,0,0},
+    {"incrby",incrbyCommand,3,"wmFJ",0,NULL,1,1,1,0,0},
+    {"decrby",decrbyCommand,3,"wmFJ",0,NULL,1,1,1,0,0},
+    {"incrbyfloat",incrbyfloatCommand,3,"wmFJ",0,NULL,1,1,1,0,0},
+    {"getset",getsetCommand,3,"wmJ",0,NULL,1,1,1,0,0},
     {"mset",msetCommand,-3,"wm",0,NULL,1,-1,2,0,0},
     {"msetnx",msetnxCommand,-3,"wm",0,NULL,1,-1,2,0,0},
     {"randomkey",randomkeyCommand,1,"rR",0,NULL,0,0,0,0,0},
@@ -225,13 +232,15 @@ struct redisCommand redisCommandTable[] = {
     {"move",moveCommand,3,"wF",0,NULL,1,1,1,0,0},
     {"rename",renameCommand,3,"w",0,NULL,1,2,1,0,0},
     {"renamenx",renamenxCommand,3,"wF",0,NULL,1,2,1,0,0},
-    {"expire",expireCommand,3,"wF",0,NULL,1,1,1,0,0},
-    {"expireat",expireatCommand,3,"wF",0,NULL,1,1,1,0,0},
-    {"pexpire",pexpireCommand,3,"wF",0,NULL,1,1,1,0,0},
-    {"pexpireat",pexpireatCommand,3,"wF",0,NULL,1,1,1,0,0},
-    {"keys",keysCommand,2,"rS",0,NULL,0,0,0,0,0},
+    {"expire",expireCommand,3,"wFj",0,NULL,1,1,1,0,0},
+    {"expireat",expireatCommand,3,"wFj",0,NULL,1,1,1,0,0},
+    {"pexpire",pexpireCommand,3,"wFj",0,NULL,1,1,1,0,0},
+    {"pexpireat",pexpireatCommand,3,"wFj",0,NULL,1,1,1,0,0},
+    {"keys",keysCommand,2,"rSj",0,NULL,0,0,0,0,0},
+    {"rediskeys",keysCommand,2,"rSj",0,NULL,0,0,0,0,0},
+    {"ssdbkeys",keysCommand,2,"rSj",0,NULL,0,0,0,0,0},
     {"scan",scanCommand,-2,"rR",0,NULL,0,0,0,0,0},
-    {"dbsize",dbsizeCommand,1,"rF",0,NULL,0,0,0,0,0},
+    {"dbsize",dbsizeCommand,1,"rFj",0,NULL,0,0,0,0,0},
     {"auth",authCommand,2,"sltF",0,NULL,0,0,0,0,0},
     {"ping",pingCommand,-1,"tF",0,NULL,0,0,0,0,0},
     {"echo",echoCommand,2,"F",0,NULL,0,0,0,0,0},
@@ -240,22 +249,23 @@ struct redisCommand redisCommandTable[] = {
     {"bgrewriteaof",bgrewriteaofCommand,1,"a",0,NULL,0,0,0,0,0},
     {"shutdown",shutdownCommand,-1,"alt",0,NULL,0,0,0,0,0},
     {"lastsave",lastsaveCommand,1,"RF",0,NULL,0,0,0,0,0},
-    {"type",typeCommand,2,"rF",0,NULL,1,1,1,0,0},
-    {"multi",multiCommand,1,"sF",0,NULL,0,0,0,0,0},
-    {"exec",execCommand,1,"sM",0,NULL,0,0,0,0,0},
-    {"discard",discardCommand,1,"sF",0,NULL,0,0,0,0,0},
-    {"sync",syncCommand,1,"ars",0,NULL,0,0,0,0,0},
-    {"psync",syncCommand,3,"ars",0,NULL,0,0,0,0,0},
+    {"type",typeCommand,2,"rFJ",0,NULL,1,1,1,0,0},
+    {"multi",multiCommand,1,"sFn",0,NULL,0,0,0,0,0},
+    {"exec",execCommand,1,"sMn",0,NULL,0,0,0,0,0},
+    {"discard",discardCommand,1,"sFn",0,NULL,0,0,0,0,0},
+    {"sync",syncCommand,1,"arsj",0,NULL,0,0,0,0,0},
+    {"psync",syncCommand,3,"arsj",0,NULL,0,0,0,0,0},
     {"replconf",replconfCommand,-1,"aslt",0,NULL,0,0,0,0,0},
-    {"flushdb",flushdbCommand,-1,"w",0,NULL,0,0,0,0,0},
-    {"flushall",flushallCommand,-1,"w",0,NULL,0,0,0,0,0},
+    /* for swap mode, we replace flushdb by flushall */
+    {"flushdb",flushallCommand,-1,"wJ",0,NULL,0,0,0,0,0},
+    {"flushall",flushallCommand,-1,"wJ",0,NULL,0,0,0,0,0},
     {"sort",sortCommand,-2,"wm",0,sortGetKeys,1,1,1,0,0},
     {"info",infoCommand,-1,"lt",0,NULL,0,0,0,0,0},
     {"monitor",monitorCommand,1,"as",0,NULL,0,0,0,0,0},
-    {"ttl",ttlCommand,2,"rF",0,NULL,1,1,1,0,0},
+    {"ttl",ttlCommand,2,"rFj",0,NULL,1,1,1,0,0},
     {"touch",touchCommand,-2,"rF",0,NULL,1,1,1,0,0},
-    {"pttl",pttlCommand,2,"rF",0,NULL,1,1,1,0,0},
-    {"persist",persistCommand,2,"wF",0,NULL,1,1,1,0,0},
+    {"pttl",pttlCommand,2,"rFj",0,NULL,1,1,1,0,0},
+    {"persist",persistCommand,2,"wFJ",0,NULL,1,1,1,0,0},
     {"slaveof",slaveofCommand,3,"ast",0,NULL,0,0,0,0,0},
     {"role",roleCommand,1,"lst",0,NULL,0,0,0,0,0},
     {"debug",debugCommand,-1,"as",0,NULL,0,0,0,0,0},
@@ -266,26 +276,27 @@ struct redisCommand redisCommandTable[] = {
     {"punsubscribe",punsubscribeCommand,-1,"pslt",0,NULL,0,0,0,0,0},
     {"publish",publishCommand,3,"pltF",0,NULL,0,0,0,0,0},
     {"pubsub",pubsubCommand,-2,"pltR",0,NULL,0,0,0,0,0},
-    {"watch",watchCommand,-2,"sF",0,NULL,1,-1,1,0,0},
-    {"unwatch",unwatchCommand,1,"sF",0,NULL,0,0,0,0,0},
+    {"watch",watchCommand,-2,"sFn",0,NULL,1,-1,1,0,0},
+    {"unwatch",unwatchCommand,1,"sFn",0,NULL,0,0,0,0,0},
     {"cluster",clusterCommand,-2,"a",0,NULL,0,0,0,0,0},
-    {"restore",restoreCommand,-4,"wm",0,NULL,1,1,1,0,0},
-    {"restore-asking",restoreCommand,-4,"wmk",0,NULL,1,1,1,0,0},
-    {"migrate",migrateCommand,-6,"w",0,migrateGetKeys,0,0,0,0,0},
+    {"restore",restoreCommand,-4,"wmJ",0,NULL,1,1,1,0,0},
+    // todo: support migrate and restore-asking(?)
+    {"restore-asking",restoreCommand,-4,"wmkj",0,NULL,1,1,1,0,0},
+    {"migrate",migrateCommand,-6,"wJ",0,migrateGetKeys,0,0,0,0,0},
     {"asking",askingCommand,1,"F",0,NULL,0,0,0,0,0},
     {"readonly",readonlyCommand,1,"F",0,NULL,0,0,0,0,0},
     {"readwrite",readwriteCommand,1,"F",0,NULL,0,0,0,0,0},
-    {"dump",dumpCommand,2,"r",0,NULL,1,1,1,0,0},
-    {"object",objectCommand,3,"r",0,NULL,2,2,2,0,0},
-    {"memory",memoryCommand,-2,"r",0,NULL,0,0,0,0,0},
+    {"dump",dumpCommand,2,"rJ",0,NULL,1,1,1,0,0},
+    {"object",objectCommand,3,"rj",0,NULL,2,2,2,0,0},
+    {"memory",memoryCommand,-2,"rj",0,NULL,0,0,0,0,0},
     {"client",clientCommand,-2,"as",0,NULL,0,0,0,0,0},
-    {"eval",evalCommand,-3,"s",0,evalGetKeys,0,0,0,0,0},
-    {"evalsha",evalShaCommand,-3,"s",0,evalGetKeys,0,0,0,0,0},
+    {"eval",evalCommand,-3,"sn",0,evalGetKeys,0,0,0,0,0},
+    {"evalsha",evalShaCommand,-3,"sn",0,evalGetKeys,0,0,0,0,0},
     {"slowlog",slowlogCommand,-2,"a",0,NULL,0,0,0,0,0},
-    {"script",scriptCommand,-2,"s",0,NULL,0,0,0,0,0},
+    {"script",scriptCommand,-2,"sn",0,NULL,0,0,0,0,0},
     {"time",timeCommand,1,"RF",0,NULL,0,0,0,0,0},
     {"bitop",bitopCommand,-4,"wm",0,NULL,2,-1,1,0,0},
-    {"bitcount",bitcountCommand,-2,"r",0,NULL,1,1,1,0,0},
+    {"bitcount",bitcountCommand,-2,"rJ",0,NULL,1,1,1,0,0},
     {"bitpos",bitposCommand,-3,"r",0,NULL,1,1,1,0,0},
     {"wait",waitCommand,3,"s",0,NULL,0,0,0,0,0},
     {"command",commandCommand,0,"lt",0,NULL,0,0,0,0,0},
@@ -297,15 +308,96 @@ struct redisCommand redisCommandTable[] = {
     {"geohash",geohashCommand,-2,"r",0,NULL,1,1,1,0,0},
     {"geopos",geoposCommand,-2,"r",0,NULL,1,1,1,0,0},
     {"geodist",geodistCommand,-4,"r",0,NULL,1,1,1,0,0},
-    {"pfselftest",pfselftestCommand,1,"a",0,NULL,0,0,0,0,0},
+    {"pfselftest",pfselftestCommand,1,"an",0,NULL,0,0,0,0,0},
     {"pfadd",pfaddCommand,-2,"wmF",0,NULL,1,1,1,0,0},
     {"pfcount",pfcountCommand,-2,"r",0,NULL,1,-1,1,0,0},
     {"pfmerge",pfmergeCommand,-2,"wm",0,NULL,1,-1,1,0,0},
     {"pfdebug",pfdebugCommand,-3,"w",0,NULL,0,0,0,0,0},
     {"post",securityWarningCommand,-1,"lt",0,NULL,0,0,0,0,0},
     {"host:",securityWarningCommand,-1,"lt",0,NULL,0,0,0,0,0},
-    {"latency",latencyCommand,-2,"aslt",0,NULL,0,0,0,0,0}
+    {"latency",latencyCommand,-2,"aslt",0,NULL,0,0,0,0,0},
+
+    /* Interfaces called by SSDB. */
+    {"ssdb-resp-del",ssdbRespDelCommand,3,"wj",0,NULL,1,-1,1,0,0},
+    {"ssdb-resp-restore",ssdbRespRestoreCommand,6,"wmj",0,NULL,1,1,1,0,0},
+    {"ssdb-resp-fail",ssdbRespFailCommand,4,"wj",0,NULL,1,1,1,0,0},
+    {"ssdb-resp-notfound",ssdbRespNotfoundCommand,4,"wj",0,NULL,1,1,1,0,0},
+
+    /* used by slave ssdb to notify slave redis when transfer ssdb snapshot. */
+    {"ssdb-notify-redis",ssdbNotifyCommand,-4,"lj",0,NULL,0,0,0,0,0},
+
+    {"listloadingkeys",listLoadingKeysCommand,1,"j",0,NULL,0,0,0,0,0},
+
+    {"storetossdb",storetossdbCommand,2,"wj",0,NULL,1,1,1,0,0},
+    {"dumpfromssdb",dumpfromssdbCommand,2,"wj",0,NULL,1,1,1,0,0},
+    {"locatekey",locatekeyCommand,2,"rj",0,NULL,1,1,1,0,0},
+    {"setlfu",setlfuCommand,3,"j",0,NULL,1,1,1,0,0},
+    {"restoressdbkey",restoreCommand,-4,"wmj",0,NULL,1,1,1,0,0},
 };
+
+struct expiretimeInfo expiretimeInfoTable[] = {
+    {setexCommand, UNIT_SECONDS, 1, 2},
+    {psetexCommand, UNIT_MILLISECONDS, 1, 2},
+    {expireCommand, UNIT_SECONDS, 1, 2},
+    {pexpireCommand, UNIT_MILLISECONDS, 1, 2},
+    {expireatCommand, UNIT_SECONDS, 0, 2},
+    {pexpireatCommand, UNIT_MILLISECONDS, 0, 2},
+};
+
+/* for test purpose only */
+void setlfuCommand(client *c) {
+    dictEntry *de, *ede;
+
+    if (c->argc != 3) {
+        addReply(c, shared.syntaxerr);
+        return;
+    }
+    ede = dictFind(EVICTED_DATA_DB->dict, c->argv[1]->ptr);
+    if (ede)
+        de = ede;
+    else
+        de = dictFind(server.db[0].dict, c->argv[1]->ptr);
+    if (de) {
+        long arg2;
+        unsigned char counter;
+
+        if (1 == string2l(c->argv[2]->ptr, sdslen(c->argv[2]->ptr), &arg2) && arg2 >= 0 && arg2 <= 255)
+            counter = (unsigned char)arg2;
+        else {
+            addReplyErrorFormat(c, "the second argment(%s) should be an integer between [0-255]",
+                                (char*)c->argv[2]->ptr);
+            return;
+        }
+        sds db_key = dictGetKey(de);
+        unsigned int lfu = sdsgetlfu(db_key);
+        unsigned short ldt = lfu >> 8;
+        sdssetlfu(db_key, ((ldt << 8) | counter));
+        addReply(c,shared.ok);
+        return;
+    }
+    addReply(c,shared.nullbulk);
+}
+
+void locatekeyCommand(client *c) {
+    char *replyString;
+    robj *replyObj;
+
+    if (!server.swap_mode) {
+        addReplyErrorFormat(c,"Command only supported in swap-mode '%s'",
+                            (char*)c->argv[0]->ptr);
+        return;
+    }
+
+    serverAssert(c->argc == 2);
+
+    replyString = lookupKey(EVICTED_DATA_DB, c->argv[1], LOOKUP_NOTOUCH)
+        ? "ssdb" : (lookupKey(c->db, c->argv[1], LOOKUP_NOTOUCH)
+                    ? "redis" : "none");
+
+    replyObj = createStringObject(replyString, strlen(replyString));
+    addReplyBulk(c, replyObj);
+    decrRefCount(replyObj);
+}
 
 /*============================ Utility functions ============================ */
 
@@ -478,6 +570,14 @@ void dictSdsDestructor(void *privdata, void *val)
 
     sdsfree(val);
 }
+
+void *dictSdsDup(void *privdata, const void *key)
+{
+    DICT_NOTUSED(privdata);
+
+    return (void *)sdsdup((char *)key);
+}
+
 
 int dictObjKeyCompare(void *privdata, const void *key1,
         const void *key2)
@@ -690,6 +790,16 @@ dictType replScriptCacheDictType = {
     NULL                        /* val destructor */
 };
 
+/* Db->visiting_ssdb_keys */
+dictType keyDictType = {
+    dictSdsHash,                /* hash function */
+    dictSdsDup,                 /* key dup */
+    NULL,                       /* val dup */
+    dictSdsKeyCompare,          /* key compare */
+    dictSdsDestructor,          /* key destructor */
+    NULL                        /* val destructor */
+};
+
 int htNeedsResize(dict *dict) {
     long long size, used;
 
@@ -795,7 +905,8 @@ int clientsCronHandleTimeout(client *c, mstime_t now_ms) {
 
         if (c->bpop.timeout != 0 && c->bpop.timeout < now_ms) {
             /* Handle blocking operation specific timeout. */
-            replyToBlockedClientTimedOut(c);
+            if (replyToBlockedClientTimedOut(c) == C_ERR)
+                return 1;
             unblockClient(c);
         } else if (server.cluster_enabled) {
             /* Cluster: handle unblock & redirect of clients blocked
@@ -833,6 +944,78 @@ int clientsCronResizeQueryBuffer(client *c) {
     return 0;
 }
 
+#define IS_NOT_CONNECTED(c) (!(c) || (!((c)->ssdb_conn_flags & CONN_CHECK_REPOPID) \
+    && !((c)->ssdb_conn_flags & CONN_SUCCESS)))
+
+#define RECONNECT_SPECIAL_CLIENT(sp_client) {\
+    if (!sp_client)\
+        sp_client = createSpecialSSDBclient();\
+    else if (sp_client->ssdb_conn_flags & CONN_CONNECT_FAILED) {\
+        nonBlockConnectToSsdbServer(sp_client);\
+    }\
+    total_ssdb_conn++;\
+    if (IS_NOT_CONNECTED(sp_client))\
+        total_ssdb_disconnected++;\
+}
+
+void reconnectSSDB() {
+    listNode* ln;
+    listIter li;
+    if (server.is_doing_flushall) {
+        serverLog(LL_DEBUG, "flushall check is going on, avoid to reconnect SSDB now");
+        /* maybe redis is doing flush check before flushall.*/
+        return;
+    }
+    if (server.ssdb_status > SSDB_NONE && server.ssdb_status < MASTER_SSDB_SNAPSHOT_PRE) {
+        serverLog(LL_DEBUG, "replication write check is going on, avoid to reconnect SSDB now");
+        /* redis is doing write check before replication. */
+        return;
+    }
+    int total_ssdb_conn = 0;
+    int total_ssdb_disconnected = 0;
+
+    RECONNECT_SPECIAL_CLIENT(server.ssdb_client);
+    RECONNECT_SPECIAL_CLIENT(server.delete_confirm_client);
+
+    /* if ssdb is down before this, we just try two connections. avoid too many
+     * reconnect retries. */
+    if (server.ssdb_is_down) return;
+
+    RECONNECT_SPECIAL_CLIENT(server.slave_ssdb_load_evict_client);
+    RECONNECT_SPECIAL_CLIENT(server.ssdb_replication_client);
+    RECONNECT_SPECIAL_CLIENT(server.expired_delete_client);
+
+    if (NULL == server.master && server.cached_master &&
+        IS_NOT_CONNECTED(server.cached_master)) {
+        RECONNECT_SPECIAL_CLIENT(server.cached_master);
+    }
+
+    listRewind(server.clients, &li);
+    while ((ln = listNext(&li))) {
+        client *c = listNodeValue(ln);
+        total_ssdb_conn++;
+        if (IS_NOT_CONNECTED(c))
+            total_ssdb_disconnected++;
+        if (c->ssdb_conn_flags & CONN_CONNECT_FAILED) {
+            nonBlockConnectToSsdbServer(c);
+        }
+    }
+
+    if (total_ssdb_conn == total_ssdb_disconnected) {
+        serverLog(LL_NOTICE, "[!!!]SSDB is down");
+        server.ssdb_is_down = 1;
+        server.ssdb_down_time = server.unixtime;
+
+        if (server.ssdb_status > SSDB_NONE)
+            abortCustomizedReplication();
+    }
+
+    run_with_period(2000) {
+        if (server.ssdb_down_time != -1 && server.ssdb_down_time - server.unixtime > 10)
+            serverLog(LL_WARNING, "ssdb is down and last for %ld seconds", server.ssdb_down_time - server.unixtime);
+    }
+}
+
 #define CLIENTS_CRON_MIN_ITERATIONS 5
 void clientsCron(void) {
     /* Make sure to process at least numclients/server.hz of clients
@@ -866,6 +1049,8 @@ void clientsCron(void) {
         if (clientsCronHandleTimeout(c,now)) continue;
         if (clientsCronResizeQueryBuffer(c)) continue;
     }
+
+    if (server.swap_mode) reconnectSSDB();
 }
 
 /* This function handles 'background' operations we are required to do
@@ -895,6 +1080,9 @@ void databasesCron(void) {
         static unsigned int rehash_db = 0;
         int dbs_per_call = CRON_DBS_PER_CALL;
         int j;
+
+        if (server.swap_mode)
+            dbs_per_call += 1;
 
         /* Don't test more DBs than we have. */
         if (dbs_per_call > server.dbnum) dbs_per_call = server.dbnum;
@@ -1030,6 +1218,22 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 
     /* Handle background operations on Redis databases. */
     databasesCron();
+
+    if (server.swap_mode) {
+        /* check operations before flushall/flushdb is timeout.*/
+        if (server.flush_check_begin_time != -1 && server.unixtime - server.flush_check_begin_time > 5) {
+            serverLog(LL_DEBUG, "[flushall] flush check timeout. there are [%d] flush check responses unreceived",
+                      server.flush_check_unresponse_num);
+            server.flush_check_begin_time = -1;
+            server.flush_check_unresponse_num = -1;
+            server.prohibit_ssdb_read_write = NO_PROHIBIT_SSDB_READ_WRITE;
+            server.is_doing_flushall = 0;
+
+            handleClientsBlockedOnFlushall();
+            /* just disconnected the timeout client doing flushall. */
+            if (server.current_flushall_client) freeClient(server.current_flushall_client);
+        }
+    }
 
     /* Start a scheduled AOF rewrite if this was requested by the user while
      * a BGSAVE was in progress. */
@@ -1176,6 +1380,386 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     return 1000/server.hz;
 }
 
+int memoryReachTransferLowerLimit() {
+    /* don't evict cold keys when server.maxmemory is unlimited. so just think
+     * reach the lower limit of cold key transfer. */
+    if (server.maxmemory == 0) {
+        return 1;
+    }
+    /* there is no limit for cold keys transfer.*/
+    if (server.ssdb_transfer_lower_limit == 0) {
+        return 0;
+    }
+    float transfer_lower_threshold = 1.0*server.ssdb_transfer_lower_limit/100;
+    float used_percent = 1.0*zmalloc_used_memory()/server.maxmemory;
+    if (used_percent <= transfer_lower_threshold) {
+        return 1;
+    }
+    return 0;
+}
+
+int memoryReachLoadUpperLimit() {
+    if (server.maxmemory == 0 || server.ssdb_load_upper_limit == 0) {
+        return 0;
+    }
+    float load_upper_threshold = 1.0*server.ssdb_load_upper_limit/100;
+    float used_percent = 1.0*zmalloc_used_memory()/server.maxmemory;
+    if (used_percent >= load_upper_threshold) {
+        return 1;
+    }
+    return 0;
+}
+
+void startToEvictIfNeeded() {
+    size_t mem_tofree, old_mem_tofree = 0;
+    float transfer_lower_threshold;
+
+    if (server.ssdb_client == NULL || !(server.ssdb_client->ssdb_conn_flags & CONN_SUCCESS)) return;
+
+    if (server.maxmemory == 0
+        || !(server.maxmemory_policy & MAXMEMORY_FLAG_LFU))
+        return;
+
+    if (memoryReachTransferLowerLimit()) {
+        return;
+    }
+
+    if (server.is_allow_ssdb_write == DISALLOW_SSDB_WRITE ||
+        server.prohibit_ssdb_read_write == PROHIBIT_SSDB_READ_WRITE)
+        return;
+
+    transfer_lower_threshold = 1.0 * server.ssdb_transfer_lower_limit/100;
+    mem_tofree = zmalloc_used_memory() - server.maxmemory * transfer_lower_threshold;
+
+    while ( mem_tofree > 0 && mem_tofree != old_mem_tofree) {
+        old_mem_tofree = mem_tofree;
+        if (C_ERR == tryEvictingKeysToSSDB(&mem_tofree)) {
+            break;
+        }
+    }
+
+    while (dictSize(EVICTED_DATA_DB->transferring_keys) <= (unsigned long)server.master_max_concurrent_transferring_keys
+           && listLength(server.storetossdb_migrate_keys)) {
+        listNode *head = listIndex(server.storetossdb_migrate_keys, 0);
+        robj *keyobj = head->value;
+        if (prologOfEvictingToSSDB(keyobj, server.db) == C_OK) {
+            serverLog(LL_DEBUG, "migrate log: run storetossdb %s", (char *)keyobj->ptr);
+        } else {
+            /* Key is not in redis or link error. */
+        }
+
+        serverLog(LL_DEBUG, "migrate log: key: %s is deleted from server.storetossdb_migrate_keys",
+                  (char *)keyobj->ptr);
+        listDelNode(server.storetossdb_migrate_keys, head);
+    }
+}
+
+#define RESERVED_MEMORY_WHEN_LOAD (1024*1024*2)
+int isMeetLoadCondition() {
+    if (server.is_allow_ssdb_write == DISALLOW_SSDB_WRITE) {
+        serverLog(LL_DEBUG, "replication check write is going on.");
+        return 0;
+    }
+
+    if (server.prohibit_ssdb_read_write == PROHIBIT_SSDB_READ_WRITE) {
+        serverLog(LL_DEBUG, "flushall check is going on.");
+        return 0;
+    }
+
+    if (server.ssdb_client == NULL || !(server.ssdb_client->ssdb_conn_flags & CONN_SUCCESS)) {
+        serverLog(LL_DEBUG, "server.ssdb_client is not connected");
+        goto clean_hot_keys;
+    }
+
+    size_t mem_free = server.maxmemory - zmalloc_used_memory();
+
+    if (server.maxmemory > 0 && mem_free <= RESERVED_MEMORY_WHEN_LOAD)
+        goto clean_hot_keys;
+
+    if (memoryReachLoadUpperLimit())
+        goto clean_hot_keys;
+
+    return 1;
+
+clean_hot_keys:
+    cleanAndSignalHotKeys();
+    return 0;
+}
+
+/* when the visiting count of this key in visiting_ssdb_keys decrese to 0 and this
+ * key is deleted from visiting_ssdb_keys, we can confirm that this key is not in
+ * transferring_keys/delete_confirm_keys/loading_hot_keys, we call this function to
+ * load the key immediately if the key is in server.hot_keys. */
+void loadThisKeyImmediately(sds key) {
+    if (0 == isMeetLoadCondition()) {
+        return;
+    }
+
+    robj* o = createObject(OBJ_STRING, sdsdup(key));
+    if (NULL == dictFind(EVICTED_DATA_DB->dict, key)) {
+        /* key is not existed any more. */
+        if (dictDelete(server.hot_keys, key) == DICT_OK)
+            signalBlockingKeyAsReady(&server.db[0], o);
+        decrRefCount(o);
+        return;
+    }
+
+    prologOfLoadingFromSSDB(NULL, o);
+    /* the key is in loading_hot_keys now, so don't signal it. */
+    decrRefCount(o);
+}
+
+void startToLoadIfNeeded() {
+    dictIterator *di;
+    dictEntry *de;
+
+    if (0 == isMeetLoadCondition()) {
+        return;
+    }
+
+    if (!server.hot_keys || !dictSize(server.hot_keys))
+        return;
+
+    di = dictGetSafeIterator(server.hot_keys);
+    while((de = dictNext(di)) != NULL) {
+        sds key = dictGetKey(de);
+
+        if (dictFind(EVICTED_DATA_DB->transferring_keys, key)
+            || dictFind(EVICTED_DATA_DB->loading_hot_keys, key)
+            || dictFind(EVICTED_DATA_DB->delete_confirm_keys, key)) {
+            /* although this is impossible. */
+            serverAssert(0);
+            continue;
+        }
+
+        if (dictFind(EVICTED_DATA_DB->visiting_ssdb_keys, key)
+            || isMigratingSSDBKey(key)) {
+            /* Try to load the key later. */
+            continue;
+        }
+
+        if (NULL == dictFind(EVICTED_DATA_DB->dict, key)) {
+            /* key is not existed any more. */
+            robj* o = createObject(OBJ_STRING, sdsdup(key));
+            if (DICT_OK == dictDelete(server.hot_keys, key))
+                signalBlockingKeyAsReady(&server.db[0], o);
+            decrRefCount(o);
+            continue;
+        }
+
+        if (server.maxmemory > 0 && (memoryReachLoadUpperLimit() ||
+                (server.maxmemory - RESERVED_MEMORY_WHEN_LOAD <= zmalloc_used_memory()))) {
+            serverLog(LL_DEBUG, "No more memory to load key: %s from SSDB to redis.",
+                      (char *)key);
+            /* we have no more memory to load keys, just clean and signal all keys in
+             * server.hot_keys to unblock some clients are blocking and waiting for them
+             * to load. */
+            cleanAndSignalHotKeys();
+            return;
+        }
+
+        serverLog(LL_DEBUG, "Try loading key: %s from SSDB.", (char *)key);
+
+        robj* o = createObject(OBJ_STRING, sdsdup(key));
+        prologOfLoadingFromSSDB(NULL, o);
+        decrRefCount(o);
+    }
+    dictReleaseIterator(di);
+    return;
+}
+
+void startToHandleCmdListInSlave(void) {
+    dictEntry *de;
+    uint64_t type;
+    sds key;
+    int count;
+
+    if (server.repl_state != REPL_STATE_CONNECTED)
+        return;
+
+    if (dictSize(server.loadAndEvictCmdDict) == 0
+        || !server.slave_ssdb_load_evict_client) return;
+
+    /* limit concurrent transferring/loading keys, avoid to reduce preformance of replication. */
+    if (dictSize(EVICTED_DATA_DB->transferring_keys)+dictSize(EVICTED_DATA_DB->loading_hot_keys) >=
+        (unsigned long)server.slave_max_concurrent_ssdb_swap_count)
+        return;
+
+    /* prohibit to load keys from SSDB if the SSDB connection status of server.master
+    * is not CONN_SUCCESS. because if a SSDB write command of a key is in server.ssdb_write_oplist,
+    * and we move the key from ssdb to redis, after the ssdb connection of server.master reconnect
+    * successfully, the SSDB write command in server.ssdb_write_oplist will fail to execute(because
+    * the key is not exist in SSDB already).
+    *
+    * also we prohibit to transfer keys to SSDB if the SSDB connection status of server.master
+    * is not CONN_SUCCESS. considering that if there is failed delCommand for a key in
+    * server.ssdb_write_oplist, if new namesake key is generated and transferred to SSDB before
+    * we re-send the failed delCommand, we maybe delete the new namesake key by mistake(
+    * for some reasons, delCommand would delete the key index directly, see updateExpireInfo).
+    * */
+    if (!server.master || !(server.master->ssdb_conn_flags & CONN_SUCCESS))
+        return;
+
+    count = 0;
+    while (1) {
+        /* for slave redis, limit the transfer/load operation count to MAX_SSDB_SWAP_COUNT_EVERY_TIME every time,
+        * avoid to cause a long time delay of data replication for server.master when do stress test. */
+        if (count >= server.slave_max_ssdb_swap_count_everytime) break;
+
+        de = dictGetRandomKey(server.loadAndEvictCmdDict);
+        if (!de) break;
+
+        count++;
+        key = dictGetKey(de);
+        type = dictGetUnsignedIntegerVal(de);
+
+        server.cmdNotDone = 0;
+
+        if (TYPE_LOAD_KEY_FORM_SSDB == type) {
+            server.load_evict_argv[0] = shared.dumpcmdobj;
+            server.slave_ssdb_load_evict_client->cmd = server.dumpfromssdbCommand;
+        } else if (TYPE_TRANSFER_TO_SSDB == type) {
+            server.load_evict_argv[0] = shared.storecmdobj;
+            server.slave_ssdb_load_evict_client->cmd = server.storetossdbCommand;
+        }
+        server.load_evict_argv[1] = server.load_evict_key_arg;
+        server.load_evict_argv[1]->ptr = key;
+
+        server.slave_ssdb_load_evict_client->argv = server.load_evict_argv;
+        server.slave_ssdb_load_evict_client->argc = 2;
+
+        server.slave_ssdb_load_evict_client->lastcmd = server.slave_ssdb_load_evict_client->cmd;
+
+        runCommand(server.slave_ssdb_load_evict_client);
+
+        server.slave_ssdb_load_evict_client->argv = NULL;
+        if (0 == server.cmdNotDone) {
+            serverLog(LL_DEBUG, "beforesleep processing cmd: %s", server.slave_ssdb_load_evict_client->cmd->name);
+            /* !!!don't use 'key' after dictDelete, because it has been freed. */
+            dictDelete(server.loadAndEvictCmdDict, key);
+        }
+        resetClient(server.slave_ssdb_load_evict_client);
+    }
+    serverLog(LL_DEBUG, "do startToHandleCmdListInSlave, dictSize:%lu", dictSize(server.loadAndEvictCmdDict));
+}
+
+#define MAX_NUM_EXPIRED_DELETE_EVERY_TIME 10
+void handleSSDBkeysToClean(void) {
+    dictIterator *di;
+    dictEntry *de;
+    int arg_pos;
+    unsigned int size = dictSize(EVICTED_DATA_DB->ssdb_keys_to_clean);
+
+    if (0 == size)
+        return;
+
+    if (!server.expired_delete_client ||
+        !(server.expired_delete_client->ssdb_conn_flags & CONN_SUCCESS))
+        return;
+
+    if (server.expired_delete_client->flags & CLIENT_BLOCKED)
+        return;
+
+    /* we delete 10 expired ssdb keys at most every time. */
+    server.expired_delete_client->argc = 1 + (size > MAX_NUM_EXPIRED_DELETE_EVERY_TIME ?
+                                              MAX_NUM_EXPIRED_DELETE_EVERY_TIME : size);
+    server.expired_delete_client->cmd = lookupCommandByCString("del");
+    if (!server.expired_delete_client->argv)
+        server.expired_delete_client->argv = zmalloc(sizeof(robj *) * (MAX_NUM_EXPIRED_DELETE_EVERY_TIME+1));
+    server.expired_delete_client->argv[0] = createObject(OBJ_STRING, sdsnew("del"));
+
+    arg_pos = 1;
+    di = dictGetSafeIterator(EVICTED_DATA_DB->ssdb_keys_to_clean);
+    while((de = dictNext(di))) {
+        if (arg_pos > MAX_NUM_EXPIRED_DELETE_EVERY_TIME)
+            break;
+        server.expired_delete_client->argv[arg_pos] = createObject(OBJ_STRING, sdsdup(de->key));
+        arg_pos++;
+    }
+    dictReleaseIterator(di);
+
+    serverAssert(arg_pos == server.expired_delete_client->argc);
+    if (C_OK != sendCommandToSSDB(server.expired_delete_client, NULL))
+        return;
+    /* TODO: use a suitable timeout. */
+    server.expired_delete_client->bpop.timeout = 5000 + mstime();
+    /* we are blocked to wait ssdb's response. */
+    blockClient(server.expired_delete_client, BLOCKED_BY_EXPIRED_DELETE);
+}
+
+void handleDeleteConfirmKeys(void) {
+    dictIterator *di;
+    dictEntry *de;
+
+    if (0 == dictSize(server.maybe_deleted_ssdb_keys))
+        return;
+
+    if (!server.delete_confirm_client ||
+        !(server.delete_confirm_client->ssdb_conn_flags & CONN_SUCCESS))
+        return;
+
+    if (server.delete_confirm_client->flags & CLIENT_BLOCKED)
+        return;
+
+    if (server.masterhost && server.repl_state != REPL_STATE_CONNECTED)
+        return;
+
+    di = dictGetSafeIterator(server.maybe_deleted_ssdb_keys);
+    while((de = dictNext(di))) {
+        if (dictFind(EVICTED_DATA_DB->delete_confirm_keys, de->key)) {
+            /* although this is impossible.*/
+            dictDelete(server.maybe_deleted_ssdb_keys, de->key);
+            continue;
+        }
+
+        if (dictFind(EVICTED_DATA_DB->visiting_ssdb_keys, de->key)) {
+            /* will try it the next time. */
+            continue;
+        }
+        if (dictFind(EVICTED_DATA_DB->transferring_keys, de->key)
+            || dictFind(server.hot_keys, de->key)
+            || dictFind(EVICTED_DATA_DB->loading_hot_keys, de->key)) {
+            /* just remove it. */
+            dictDelete(server.maybe_deleted_ssdb_keys, de->key);
+            continue;
+        }
+
+        /* if the key is in redis now, or is not in EVICTED_DATA_DB(for slave), don't need check it */
+        if (dictFind(server.db->dict, de->key) || !dictFind(EVICTED_DATA_DB->dict, de->key)) {
+            dictDelete(server.maybe_deleted_ssdb_keys, de->key);
+            continue;
+        }
+
+        server.delete_confirm_client->argc = 2;
+        server.delete_confirm_client->cmd = lookupCommandByCString("exists");
+        if (!server.delete_confirm_client->argv)
+            server.delete_confirm_client->argv = zmalloc(sizeof(robj *)
+                                                         * server.delete_confirm_client->argc);
+
+        server.delete_confirm_client->argv[0] = createObject(OBJ_STRING, sdsnew("exists"));
+        server.delete_confirm_client->argv[1] = createObject(OBJ_STRING, sdsdup(de->key));
+
+        if (C_OK != sendCommandToSSDB(server.delete_confirm_client, NULL)) {
+            /* server.delete_confirm_client->argv will be freed in freeClient */
+            break;
+        }
+
+        /* TODO: use a suitable timeout. */
+        server.delete_confirm_client->bpop.timeout = 2000 + mstime();
+        blockClient(server.delete_confirm_client, BLOCKED_BY_DELETE_CONFIRM);
+        /* we are blocked to wait ssdb's response for this key, can't continue and just break this loop. */
+
+        dictAddOrFind(EVICTED_DATA_DB->delete_confirm_keys, de->key);
+        serverLog(LL_DEBUG, "start to confirm with ssdb whether key: %s is deleted", (sds)de->key);
+
+        /* to avoid access null pointer, we must delete the key from dict at the last line.*/
+        dictDelete(server.maybe_deleted_ssdb_keys, de->key);
+        /* !!! the memory of 'de' pointer is free now. don't use it after this */
+        break;
+    }
+    dictReleaseIterator(di);
+}
+
 /* This function gets called every time Redis is entering the
  * main loop of the event driven library, that is, before to sleep
  * for ready file descriptors. */
@@ -1221,11 +1805,36 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     if (listLength(server.unblocked_clients))
         processUnblockedClients();
 
+    if (server.swap_mode && server.cached_master &&
+        (server.cached_master->flags & CLIENT_BUFFER_HAS_UNPROCESSED_DATA)) {
+        if (server.cached_master->querybuf && sdslen(server.cached_master->querybuf) > 0) {
+            processInputBufferOfMaster(server.cached_master);
+        }
+    }
+
     /* Write the AOF buffer on disk */
     flushAppendOnlyFile(0);
 
     /* Handle writes with pending output buffers. */
     handleClientsWithPendingWrites();
+
+    /* TODO: fix the population. */
+    /* Try to evict proper keys to make more free memory. */
+    if (server.swap_mode && server.masterhost == NULL) startToEvictIfNeeded();
+
+    /* Try to load keys from SSDB to redis. */
+    if (server.swap_mode && server.masterhost == NULL) startToLoadIfNeeded();
+
+    if (server.swap_mode) handleSSDBkeysToClean();
+
+    if (server.swap_mode) handleDeleteConfirmKeys();
+
+    /* Try to handle cmds(load/evict cmds) in an extra list in slave. */
+    if (server.swap_mode && server.masterhost) startToHandleCmdListInSlave();
+
+    /* Call handleCustomizedBlockedClients in beforeSleep to
+       avoid timeout when there's only 1 real client. */
+    if (server.swap_mode) handleCustomizedBlockedClients();
 
     /* Before we are going to sleep, let the threads access the dataset by
      * releasing the GIL. Redis main thread will not touch anything at this
@@ -1291,7 +1900,6 @@ void createSharedObjects(void) {
         "-NOREPLICAS Not enough good slaves to write.\r\n"));
     shared.busykeyerr = createObject(OBJ_STRING,sdsnew(
         "-BUSYKEY Target key name already exists.\r\n"));
-    shared.space = createObject(OBJ_STRING,sdsnew(" "));
     shared.colon = createObject(OBJ_STRING,sdsnew(":"));
     shared.plus = createObject(OBJ_STRING,sdsnew("+"));
 
@@ -1333,6 +1941,31 @@ void createSharedObjects(void) {
      * string in string comparisons for the ZRANGEBYLEX command. */
     shared.minstring = sdsnew("minstring");
     shared.maxstring = sdsnew("maxstring");
+
+    if (server.swap_mode) {
+        shared.repopidsetok = sdsnew("repopid setok");
+        shared.checkwriteok = sdsnew("rr_check_write ok");
+        shared.checkwritenok = sdsnew("rr_check_write nok");
+        shared.flushcheckok = sdsnew("rr_flushall_check ok");
+        shared.flushchecknok = sdsnew("rr_flushall_check nok");
+        shared.flushdoneok = sdsnew("rr_do_flushall ok");
+        shared.flushdonenok = sdsnew("rr_do_flushall nok");
+        shared.makesnapshotok = sdsnew("rr_make_snapshot ok");
+        shared.makesnapshotnok = sdsnew("rr_make_snapshot nok");
+        shared.transfersnapshotok = sdsnew("rr_transfer_snapshot ok");
+        shared.transfersnapshotnok = sdsnew("rr_transfer_snapshot nok");
+        /* for keep alive when transfer snapshot, so we can disconnect the slave if timeout. */
+        shared.transfersnapshotcontinue = sdsnew("rr_transfer_snapshot continue");
+        shared.transfersnapshotfinished = sdsnew("rr_transfer_snapshot finished");
+        shared.transfersnapshotunfinished = sdsnew("rr_transfer_snapshot unfinished");
+        shared.delsnapshotok = sdsnew("rr_del_snapshot ok");
+        shared.delsnapshotnok = sdsnew("rr_del_snapshot nok");
+
+        shared.storecmdobj = createObject(OBJ_STRING, (void *)sdsnew("storetossdb"));
+        shared.dumpcmdobj = createObject(OBJ_STRING, (void *)sdsnew("dumpfromssdb"));
+        shared.slavedelcmdobj = createObject(OBJ_STRING, (void*)sdsnew("slavedel"));
+        shared.rr_restoreobj = createObject(OBJ_STRING, (void *)sdsnew("redis_req_restore"));
+    }
 }
 
 void initServerConfig(void) {
@@ -1354,10 +1987,16 @@ void initServerConfig(void) {
     server.tcp_backlog = CONFIG_DEFAULT_TCP_BACKLOG;
     server.bindaddr_count = 0;
     server.unixsocket = NULL;
+    server.ssdb_server_unixsocket = NULL;
     server.unixsocketperm = CONFIG_DEFAULT_UNIX_SOCKET_PERM;
     server.ipfd_count = 0;
     server.sofd = -1;
+    server.ssdb_client = NULL;
+    server.ssdb_replication_client = NULL;
     server.protected_mode = CONFIG_DEFAULT_PROTECTED_MODE;
+    server.swap_mode = CONFIG_DEFAULT_SWAP_MODE;
+    server.load_from_ssdb = CONFIG_DEFAULT_LOAD_FROM_SSDB;
+    server.use_customized_replication = CONFIG_DEFAULT_USE_CUSTOMIZED_REPLICATION;
     server.dbnum = CONFIG_DEFAULT_DBNUM;
     server.verbosity = CONFIG_DEFAULT_VERBOSITY;
     server.maxidletime = CONFIG_DEFAULT_CLIENT_TIMEOUT;
@@ -1409,6 +2048,8 @@ void initServerConfig(void) {
     server.notify_keyspace_events = 0;
     server.maxclients = CONFIG_DEFAULT_MAX_CLIENTS;
     server.bpop_blocked_clients = 0;
+    server.ssdb_load_upper_limit = 0;
+    server.ssdb_transfer_lower_limit = 0;
     server.maxmemory = CONFIG_DEFAULT_MAXMEMORY;
     server.maxmemory_policy = CONFIG_DEFAULT_MAXMEMORY_POLICY;
     server.maxmemory_samples = CONFIG_DEFAULT_MAXMEMORY_SAMPLES;
@@ -1440,6 +2081,15 @@ void initServerConfig(void) {
     server.lazyfree_lazy_server_del = CONFIG_DEFAULT_LAZYFREE_LAZY_SERVER_DEL;
     server.always_show_logo = CONFIG_DEFAULT_ALWAYS_SHOW_LOGO;
     server.lua_time_limit = LUA_SCRIPT_TIME_LIMIT;
+    server.datacenter_id = 0;
+
+    server.client_visiting_ssdb_timeout = CONFIG_DEFAULT_CLIENT_VISITING_SSDB_TIMEOUT;
+    server.client_blocked_by_keys_timeout = CONFIG_DEFAULT_CLIENT_BLOCKED_BY_KEYS_TIMEOUT;
+    server.client_blocked_by_flushall_timeout = CONFIG_DEFAULT_CLIENT_BLOCKED_BY_FLUSHALL_TIMEOUT;
+    server.client_blocked_by_replication_nowrite_timeout = CONFIG_DEFAULT_CLIENT_BLOCKED_BY_REPLICATION_NOWRITE_TIMEOUT;
+    server.client_blocked_by_migrate_dump_timeout = CONFIG_DEFAULT_CLIENT_BLOCKED_BY_MIGRATE_DUMP_TIMEOUT;
+    server.client_blocked_by_migrate_timeout = CONFIG_DEFAULT_CLIENT_BLOCKED_BY_MIGRATE_TIMEOUT;
+    server.slave_blocked_by_flushall_timeout = CONFIG_DEFAULT_SLAVE_BLOCKED_BY_FLUSHALL_TIMEOUT;
 
     unsigned int lruclock = getLRUClock();
     atomicSet(server.lruclock,lruclock);
@@ -1467,6 +2117,16 @@ void initServerConfig(void) {
     server.repl_diskless_sync_delay = CONFIG_DEFAULT_REPL_DISKLESS_SYNC_DELAY;
     server.repl_ping_slave_period = CONFIG_DEFAULT_REPL_PING_SLAVE_PERIOD;
     server.repl_timeout = CONFIG_DEFAULT_REPL_TIMEOUT;
+
+    server.master_transfer_ssdb_snapshot_timeout = MASTER_TRANSFER_SSDB_SNAPSHOT_TIMEOUT;
+    server.slave_transfer_ssdb_snapshot_timeout = SLAVE_SSDB_TRANSFER_SNAPSHOT_TIMEOUT;
+    server.master_max_concurrent_loading_keys = MASTER_MAX_CONCURRENT_LOADING_KEYS;
+    server.master_max_concurrent_transferring_keys = MASTER_MAX_CONCURRENT_TRANSFERRING_KEYS;
+    server.slave_max_concurrent_ssdb_swap_count = SLAVE_MAX_CONCURRENT_SSDB_SWAP_COUNT;
+    server.slave_max_ssdb_swap_count_everytime = SLAVE_MAX_SSDB_SWAP_COUNT_EVERYTIME;
+    server.coldkey_filter_times_everytime = COLDKEY_FILTER_TIMES_EVERYTIME;
+    server.lowest_idle_val_of_cold_key = LOWEST_IDLE_VAL_OF_COLD_KEY;
+
     server.repl_min_slaves_to_write = CONFIG_DEFAULT_MIN_SLAVES_TO_WRITE;
     server.repl_min_slaves_max_lag = CONFIG_DEFAULT_MIN_SLAVES_MAX_LAG;
     server.slave_priority = CONFIG_DEFAULT_SLAVE_PRIORITY;
@@ -1508,6 +2168,13 @@ void initServerConfig(void) {
     server.execCommand = lookupCommandByCString("exec");
     server.expireCommand = lookupCommandByCString("expire");
     server.pexpireCommand = lookupCommandByCString("pexpire");
+    server.pexpireatCommand = lookupCommandByCString("pexpireat");
+    server.persistCommand = lookupCommandByCString("persist");
+    server.setCommand = lookupCommandByCString("set");
+    server.restoreCommand = lookupCommandByCString("restore");
+    server.flushallCommand = lookupCommandByCString("flushall");
+    server.dumpfromssdbCommand = lookupCommandByCString("dumpfromssdb");
+    server.storetossdbCommand = lookupCommandByCString("storetossdb");
 
     /* Slow log */
     server.slowlog_log_slower_than = CONFIG_DEFAULT_SLOWLOG_LOG_SLOWER_THAN;
@@ -1764,6 +2431,7 @@ void resetServerStats(void) {
     server.stat_evictedkeys = 0;
     server.stat_keyspace_misses = 0;
     server.stat_keyspace_hits = 0;
+    server.stat_keyspace_ssdb_hits = 0;
     server.stat_active_defrag_hits = 0;
     server.stat_active_defrag_misses = 0;
     server.stat_active_defrag_key_hits = 0;
@@ -1772,6 +2440,7 @@ void resetServerStats(void) {
     server.stat_fork_rate = 0;
     server.stat_rejected_conn = 0;
     server.stat_sync_full = 0;
+    server.stat_sync_full_ok = 0;
     server.stat_sync_partial_ok = 0;
     server.stat_sync_partial_err = 0;
     for (j = 0; j < STATS_METRIC_COUNT; j++) {
@@ -1841,6 +2510,8 @@ void initServer(void) {
         anetNonBlock(NULL,server.sofd);
     }
 
+    if (server.swap_mode) connectSepecialSSDBclients();
+
     /* Abort if there are no listening sockets at all. */
     if (server.ipfd_count == 0 && server.sofd < 0) {
         serverLog(LL_WARNING, "Configured to not listen anywhere, exiting.");
@@ -1857,6 +2528,27 @@ void initServer(void) {
         server.db[j].id = j;
         server.db[j].avg_ttl = 0;
     }
+
+    if (server.swap_mode) {
+        server.db[0].ssdb_blocking_keys = dictCreate(&keylistDictType,NULL);
+        server.db[0].blocking_keys_write_same_ssdbkey = dictCreate(&keylistDictType,NULL);
+        server.db[0].ssdb_ready_keys = dictCreate(&objectKeyPointerValueDictType,NULL);
+        server.db[0].migrating_ssdb_keys = dictCreate(&keyDictType,NULL);
+
+        server.db[EVICTED_DATA_DBID].transferring_keys = dictCreate(&keyDictType,NULL);
+        server.db[EVICTED_DATA_DBID].loading_hot_keys = dictCreate(&keyDictType,NULL);
+        server.db[EVICTED_DATA_DBID].visiting_ssdb_keys = dictCreate(&keyDictType,NULL);
+        server.db[EVICTED_DATA_DBID].delete_confirm_keys = dictCreate(&keyDictType,NULL);
+        // todo: 优化字典类型,避免较多的内存分配
+        server.db[EVICTED_DATA_DBID].ssdb_keys_to_clean = dictCreate(&keyDictType,NULL);
+
+        server.hot_keys = dictCreate(&keyDictType,NULL);
+        server.maybe_deleted_ssdb_keys = dictCreate(&keyDictType,NULL);
+
+        server.storetossdb_migrate_keys = listCreate();
+        listSetFreeMethod(server.storetossdb_migrate_keys, (void (*)(void*))decrRefCount);
+    }
+
     evictionPoolAlloc(); /* Initialize the LRU keys pool. */
     server.pubsub_channels = dictCreate(&keylistDictType,NULL);
     server.pubsub_patterns = listCreate();
@@ -1949,6 +2641,52 @@ void initServer(void) {
     latencyMonitorInit();
     bioInit();
     server.initial_memory_usage = zmalloc_used_memory();
+
+    if (server.swap_mode) {
+        server.is_allow_ssdb_write = ALLOW_SSDB_WRITE;
+        server.ssdb_status = SSDB_NONE;
+        server.ssdb_snapshot_timestamp = -1;
+        server.ssdb_repl_state = REPL_STATE_NONE;
+        server.slave_ssdb_transfer_snapshot_keepalive = -1;
+        server.check_write_begin_time = -1;
+        server.check_write_unresponse_num = -1;
+        server.no_writing_ssdb_blocked_clients = listCreate();
+        server.ssdbargv = zmalloc(sizeof(char *) * SSDB_CMD_DEFAULT_MAX_ARGC);
+        server.ssdbargvlen = zmalloc(sizeof(size_t) * SSDB_CMD_DEFAULT_MAX_ARGC);
+
+        server.global_transfer_id = 0;
+        server.loadAndEvictCmdDict = dictCreate(&keyDictType,NULL);
+
+        server.delayed_migrate_clients = listCreate();
+
+        server.retry_del_snapshot = 0;
+        server.is_doing_flushall = 0;
+        server.current_flushall_client = NULL;
+        server.prohibit_ssdb_read_write = NO_PROHIBIT_SSDB_READ_WRITE;
+        server.ssdb_flushall_blocked_clients = listCreate();
+        server.flush_check_unresponse_num = -1;
+        server.flush_check_begin_time = -1;
+
+        server.cmdNotDone = 0;
+        // for server.slave_ssdb_load_evict_client only
+        server.load_evict_argv = zmalloc(sizeof(robj*) * 2);
+        server.load_evict_key_arg = createObject(OBJ_STRING, NULL);
+
+        server.slave_ssdb_critical_err_cnt = 0;
+        server.ssdb_down_time = -1;
+        server.ssdb_is_down = 0;
+        server.ssdb_ready_keys = listCreate();
+
+        server.slave_failed_retry_interrupted = 0;
+        server.send_failed_write_after_unblock = 0;
+        server.blocked_write_op = NULL;
+        server.ssdb_write_oplist = listCreate();
+        listSetFreeMethod(server.ssdb_write_oplist, (void (*)(void*)) freeSSDBwriteOp);
+
+        server.last_send_writeop_time = -1;
+        server.last_send_writeop_index = -1;
+        server.writeop_mem_size = 0;
+    }
 }
 
 /* Populates the Redis Command Table starting from the hard coded list
@@ -1977,6 +2715,9 @@ void populateCommandTable(void) {
             case 'M': c->flags |= CMD_SKIP_MONITOR; break;
             case 'k': c->flags |= CMD_ASKING; break;
             case 'F': c->flags |= CMD_FAST; break;
+            case 'J': c->flags |= CMD_SWAP_MODE; break;
+            case 'j': c->flags |= CMD_SWAPMODE_REDIS_ONLY; break;
+            case 'n': c->flags |= CMD_SWAPMODE_NOT_ALLOWED; break;
             default: serverPanic("Unsupported command flag"); break;
             }
             f++;
@@ -2089,6 +2830,110 @@ void propagate(struct redisCommand *cmd, int dbid, robj **argv, int argc,
         feedAppendOnlyFile(cmd,dbid,argv,argc);
     if (flags & PROPAGATE_REPL)
         replicationFeedSlaves(server.slaves,dbid,argv,argc);
+}
+
+#define createObjFromSpopReply(reply) \
+    ((reply)->type == REDIS_REPLY_INTEGER) ? createStringObjectFromLongLong((reply)->integer) \
+    : (((reply)->type == REDIS_REPLY_STRING) ? createStringObject(reply->str, reply->len) : NULL); \
+
+void propagateCmdHandledBySSDB(client *c) {
+    robj *ele = NULL, *aux;
+    redisReply *reply = c->ssdb_replies[0];
+    redisReply *subreply;
+    long long milliseconds = 0;
+    robj *argv[3];
+
+    if (!c || !c->cmd || !c->argv || c->argc == 0)
+        return;
+
+    /* Replicate this command as an SREM operation. */
+    if (c->cmd->proc == spopCommand) {
+        if (reply && reply->type == REDIS_REPLY_NIL)
+            return;
+        if (reply && reply->type == REDIS_REPLY_ARRAY) {
+            aux = createStringObject("SREM", 4);
+            ele = createObjFromSpopReply(reply);
+            if (ele) {
+                rewriteClientCommandVector(c, 3, aux, c->argv[1], ele);
+                decrRefCount(aux);
+                decrRefCount(ele);
+            } else {
+                int count = reply->elements;
+                int index = 0;
+                robj *propargv[3];
+                propargv[0] = aux;
+                propargv[1] = c->argv[1];
+
+                /* TODO: optimize n srem to 1 srem. */
+                while (index < count) {
+                    subreply = reply->element[index];
+                    propargv[2] = createObjFromSpopReply(subreply);
+                    serverAssert(propargv[2]);
+
+                    propagate(server.sremCommand, 0, propargv, 3, PROPAGATE_REPL);
+                    serverLog(LL_DEBUG, "spop replication log, key: %s, member: %s", (char *)propargv[1]->ptr, (char *)propargv[2]->ptr);
+                    decrRefCount(propargv[2]);
+                    index ++;
+                }
+
+                decrRefCount(aux);
+                return;
+            }
+        }
+    }
+
+    /* Update expire time in redis and update AOF. */
+    if (((reply->type == REDIS_REPLY_STATUS && !strcasecmp(reply->str, "ok"))
+         || (reply->type == REDIS_REPLY_INTEGER && reply->integer == 1))
+        && ((milliseconds = getAbsoluteExpireTimeFromArgs(c->argv, c->argc, c->cmd)) != C_ERR)) {
+        robj *key = c->argv[1];
+
+        /* setCommand or persist. */
+        if (milliseconds == C_NO_EXPIRE) {
+            serverAssert(c->cmd->proc == setCommand || c->cmd->proc == persistCommand);
+             /* Propagate command. */
+            if (c->cmd->proc == setCommand)
+                propagate(server.setCommand, 0, c->argv, 3, PROPAGATE_REPL);
+
+            if (removeExpire(EVICTED_DATA_DB, key)) {
+                /* Update aof. */
+                argv[0] = createStringObject("PERSIST", 7);
+                argv[1] = key;
+                propagate(server.persistCommand, EVICTED_DATA_DBID, argv, 2, PROPAGATE_AOF);
+
+                propagate(server.persistCommand, 0, argv, 2, PROPAGATE_REPL);
+                decrRefCount(argv[0]);
+            }
+        } else {
+            setExpire(c, EVICTED_DATA_DB, key, milliseconds);
+
+            /* Update aof. */
+            argv[0] = createStringObject("PEXPIREAT", 9);
+            argv[1] = key;
+            argv[2] = createObject(OBJ_STRING, sdsfromlonglong(milliseconds));
+            propagate(server.pexpireatCommand, EVICTED_DATA_DBID, argv, 3, PROPAGATE_AOF);
+
+            /* Propagate command. */
+            if (c->cmd->proc == setexCommand || c->cmd->proc == psetexCommand
+                || c->cmd->proc == setCommand) {
+                robj *replargv[3];
+                replargv[0] = createStringObject("SET", 3);
+                replargv[1] = key;
+                replargv[2] = (c->cmd->proc == setCommand) ? c->argv[2] : c->argv[3];
+                propagate(server.setCommand, 0, replargv, 3, PROPAGATE_REPL);
+                decrRefCount(replargv[0]);
+            }
+
+            propagate(server.pexpireatCommand, 0, argv, 3, PROPAGATE_REPL);
+            decrRefCount(argv[0]);
+            decrRefCount(argv[2]);
+        }
+        return;
+    }
+
+    if (((c->cmd->flags & CMD_WRITE)
+         && server.masterhost == NULL && reply->type != REDIS_REPLY_ERROR))
+        propagate(c->cmd, 0, c->argv, c->argc, PROPAGATE_REPL);
 }
 
 /* Used inside commands to schedule the propagation of additional commands
@@ -2263,8 +3108,20 @@ void call(client *c, int flags) {
 
         /* Call propagate() only if at least one of AOF / replication
          * propagation is needed. */
-        if (propagate_flags != PROPAGATE_NONE)
-            propagate(c->cmd,c->db->id,c->argv,c->argc,propagate_flags);
+        if (server.swap_mode) {
+            /* for swap mode, we only propagate write command here. to avoid
+             * some special commands like psync/sync propagated, which can cause
+             * unexpected issues.*/
+            if (c->cmd->flags & CMD_WRITE) {
+                if (propagate_flags != PROPAGATE_NONE) {
+                    propagate(c->cmd,c->db->id,c->argv,c->argc,propagate_flags);
+                }
+            }
+        } else {
+            if (propagate_flags != PROPAGATE_NONE) {
+                propagate(c->cmd,c->db->id,c->argv,c->argc,propagate_flags);
+            }
+        }
     }
 
     /* Restore the old replication flags, since call() can be executed
@@ -2297,6 +3154,1064 @@ void call(client *c, int flags) {
     server.stat_numcommands++;
 }
 
+int blockInMediateKey(client* c, struct redisCommand* cmd, robj** argv, int argc) {
+    robj **keyobjs = NULL;
+    int *keys = NULL, blockednum = 0, numkeys = 0, j;
+    keys = getKeysFromCommand(cmd, argv, argc, &numkeys);
+
+    if (numkeys) {
+        keyobjs = zmalloc(sizeof(robj *) * numkeys);
+        c->first_key_index = keys[0];
+    }
+
+    for (j = 0; j < numkeys; j ++)
+        keyobjs[j] = argv[keys[j]];
+
+    /* TODO: use a suitable timeout */
+    blockednum = blockForLoadingkeys(c, cmd, keyobjs, numkeys, server.client_blocked_by_keys_timeout + mstime());
+
+    if (numkeys && keyobjs) zfree(keyobjs);
+    if (keys) getKeysFreeResult(keys);
+
+    if (blockednum) return C_ERR;
+    return C_OK;
+}
+
+/* Return C_ERR if the key is in loading or transferring state. */
+int checkKeysInMediateState(client* c) {
+    c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
+
+    /* processCommand will handle this case. */
+    if (!c->cmd || !(c->cmd->flags & (CMD_WRITE | CMD_READONLY)))
+        return C_OK;
+
+    /* Command from SSDB should not be blocked. */
+    if (c->cmd->proc == ssdbRespDelCommand
+        || c->cmd->proc == ssdbRespRestoreCommand
+        || c->cmd->proc == ssdbRespFailCommand
+        || c->cmd->proc == ssdbRespNotfoundCommand)
+        return C_OK;
+
+    return blockInMediateKey(c, c->cmd, c->argv, c->argc);
+}
+
+int checkKeysForMigrate(client *c) {
+    int first_key = 3, j;
+    robj *keyobj;
+
+    serverAssert(c->cmd->proc == migrateCommand);
+
+    for (j = 6; j < c->argc; j ++) {
+        if (!strcasecmp(c->argv[j]->ptr, "keys")) {
+            addReplyError(c, "Not supported yet in swap-mode");
+            serverLog(LL_DEBUG, "Migrate not supported keys yet in swap-mode");
+            return C_NOTSUPPORT_ERR;
+        }
+    }
+
+    keyobj = c->argv[first_key];
+    if (dictFind(EVICTED_DATA_DB->transferring_keys, keyobj->ptr)
+        || dictFind(EVICTED_DATA_DB->loading_hot_keys, keyobj->ptr)
+        || dictFind(EVICTED_DATA_DB->delete_confirm_keys, keyobj->ptr)
+        || dictFind(EVICTED_DATA_DB->visiting_ssdb_keys, keyobj->ptr)) {
+        return C_ERR;
+    }
+
+    return C_OK;
+}
+
+int blockAndFlushSlaveSSDB(client* c, struct ssdb_write_op* slave_retry_write) {
+    int ret;
+
+    /* flushall STEP 1: clean all intermediate state keys, avoid to cause unexpected issues. */
+    cleanSpecialClientsAndIntermediateKeys(1);
+
+    sds finalcmd = sdsnew("*1\r\n$14\r\nrr_do_flushall\r\n");
+    if (slave_retry_write)
+        ret = sendFailedRetryCommandToSSDB(c, finalcmd);
+    else
+        ret = sendCommandToSSDB(c, finalcmd);
+
+    if (ret != C_OK) return ret;
+    serverLog(LL_DEBUG, "send rr_do_flushall ok");
+
+    /* we just wait flushall done. */
+    c->bpop.timeout = server.slave_blocked_by_flushall_timeout+mstime();
+    blockClient(c, BLOCKED_BY_FLUSHALL);
+    return C_OK;
+}
+
+int processCommandMaybeFlushdb(client *c) {
+    int ret;
+
+    if (server.masterhost == NULL) {
+        /* only allow one flushall task running. */
+        if (server.is_doing_flushall) {
+            return C_ANOTHER_FLUSHALL_ERR;
+        } else {
+            listIter li;
+            listNode *ln;
+            client *lc;
+            int is_myself = 0;
+
+            /* for slave redis, flushall will be processed in other way. */
+            if (server.masterhost) return;
+
+            /* abort all slaves in replication status, except online slaves. */
+            if (server.ssdb_status > SSDB_NONE)
+                abortCustomizedReplication();
+
+            serverLog(LL_DEBUG, "[flushall] ===start===");
+            /* STEP 1: clean all intermediate state keys and disconnect special clients,
+             * avoid to cause unexpected issues. */
+            cleanSpecialClientsAndIntermediateKeys(1);
+            if (server.ssdb_replication_client) freeClient(server.ssdb_replication_client);
+
+            server.is_doing_flushall = 1;
+            /* save the client doing flushall. */
+            server.current_flushall_client = c;
+
+            /* STEP 2: send flushall/flushdb check commands for all connections. */
+            /* process timeout case in serverCron. */
+            server.flush_check_begin_time = server.unixtime;
+            server.prohibit_ssdb_read_write = PROHIBIT_SSDB_READ_WRITE;
+
+            /* reset to 0 */
+            server.flush_check_unresponse_num = 0;
+            listRewind(server.clients, &li);
+            while ((ln = listNext(&li)) != NULL) {
+                lc = listNodeValue(ln);
+
+                if (lc->flags & CLIENT_SLAVE) continue;
+
+                if (aeCreateFileEvent(server.el, lc->fd, AE_WRITABLE,
+                                      sendFlushCheckCommandToSSDB, lc) == AE_ERR) {
+                    if (server.current_flushall_client == lc)
+                        is_myself = 1;
+                    /* just free disconnected client and ignore it. */
+                    freeClient(lc);
+                    if (is_myself) {
+                        server.flush_check_begin_time = -1;
+                        server.flush_check_unresponse_num = -1;
+                        server.prohibit_ssdb_read_write = NO_PROHIBIT_SSDB_READ_WRITE;
+                        server.is_doing_flushall = 0;
+                        return;
+                    }
+                } else {
+                    lc->ssdb_conn_flags |= CONN_WAIT_FLUSH_CHECK_REPLY;
+                    server.flush_check_unresponse_num++;
+
+                    serverLog(LL_DEBUG, "[flushall]set c->context->fd:%d, c->fd:%d",
+                              lc->context ? lc->context->fd : -1, lc->fd);
+                }
+            }
+            serverLog(LL_DEBUG, "[flushall]initial server.flush_check_unresponse_num:%d", server.flush_check_unresponse_num);
+
+            server.current_flushall_client->bpop.timeout = server.client_blocked_by_flushall_timeout+mstime();
+            blockClient(server.current_flushall_client, BLOCKED_BY_FLUSHALL);
+            return C_OK;
+        }
+    } else {
+        if (c->flags & CLIENT_MASTER) {
+            if (c == server.cached_master || (server.master == c && server.repl_state == REPL_STATE_CONNECTED)) {
+                struct ssdb_write_op* op;
+                listNode *ln;
+
+                /* it's safe to do flushall even if ssdb connection status of server.master is CONN_CHECK_REPOPID
+                 * or CONN_CONNECT_FAILED.
+                 * Reason:
+                 * although sendCommandToSSDB will fail, we can empty server.ssdb_write_list and save 'flushall'
+                 * to the list, so that we don't need to re-send previous failed writes after connection status
+                 * turn into CONN_SUCCESS. */
+                if (!(c->ssdb_conn_flags & CONN_SUCCESS))
+                    serverLog(LL_DEBUG, "ssdb connection status of server.master is not CONN_SUCCESS");
+
+                /* before flushall, clean all visiting keys and all writes in ssdb write op list. */
+                emptySlaveSSDBwriteOperations();
+                /* clean all keys need to transfer/load */
+                dictEmpty(server.loadAndEvictCmdDict, NULL);
+                /* we must delete all key indexes in redis here. */
+                flushallCommand(c);
+
+                ret = updateSendRepopidToSSDB(c);
+                if (ret != C_OK) return ret;
+
+                ret = blockAndFlushSlaveSSDB(c, NULL);
+                if (ret != C_OK) return ret;
+
+                serverLog(LL_DEBUG, "send ssdb flushall success, server.master client is blocked");
+
+                ln = listFirst(server.ssdb_write_oplist);
+                op = ln->value;
+                serverLog(LL_DEBUG, "[REPOPID]redis send (cmd: %s, op time:%ld, op id:%d) to ssdb success",
+                          op->cmd->name, op->time, op->index);
+
+                return C_OK;
+            } else {
+                /* when RDB transfer is done but SSDB snapshot not. */
+
+                 /* before flushall, clean all visiting keys and all writes in ssdb write op list. */
+                emptySlaveSSDBwriteOperations();
+                /* clean all keys need to transfer/load */
+                dictEmpty(server.loadAndEvictCmdDict, NULL);
+
+                /* we must delete all key indexes in redis here. */
+                flushallCommand(c);
+
+                updateSlaveSSDBwriteIndex();
+                saveSlaveSSDBwriteOp(c, server.last_send_writeop_time, server.last_send_writeop_index);
+
+                return C_ERR;
+            }
+        }
+    }
+    return C_ERR;
+}
+
+
+int addMigratingSSDBKey(sds keysds) {
+    dictEntry *entry, *existing;
+    entry = dictAddRaw(server.db->migrating_ssdb_keys, keysds, &existing);
+    return !entry ? DICT_OK : DICT_ERR;
+}
+
+int isMigratingSSDBKey(sds keysds) {
+    return dictFind(server.db->migrating_ssdb_keys, keysds) ? 1 : 0;
+}
+
+int delMigratingSSDBKey(sds keysds) {
+    return dictDelete(server.db->migrating_ssdb_keys, keysds);
+}
+
+void addVisitingSSDBKey(struct redisCommand* cmd, sds keysds) {
+    dictEntry *entry, *existing;
+    uint32_t visiting_write_num = 0, visiting_read_num = 0;
+    entry = dictAddRaw(EVICTED_DATA_DB->visiting_ssdb_keys, keysds, &existing);
+    if (NULL == entry) {
+        visiting_write_num = dictGetVisitingSSDBwriteCount(existing);
+        visiting_read_num = dictGetVisitingSSDBreadCount(existing);
+
+        /* there are already some clients visiting this key. just increase client visiting count. */
+        if (cmd->flags & CMD_WRITE)
+            dictSetVisitingSSDBwriteCount(existing, visiting_write_num+1);
+        else if (cmd->flags & CMD_READONLY)
+            dictSetVisitingSSDBreadCount(existing, visiting_read_num+1);
+    } else {
+        /* no other clients are visiting this key, set client visiting num to 1. */
+        if (cmd->flags & CMD_WRITE) {
+            visiting_write_num = 1;
+            dictSetVisitingSSDBwriteCount(entry, 1);
+            dictSetVisitingSSDBreadCount(entry, 0);
+        } else if (cmd->flags & CMD_READONLY) {
+            visiting_read_num = 1;
+            dictSetVisitingSSDBreadCount(entry, 1);
+            dictSetVisitingSSDBwriteCount(entry, 0);
+        }
+    }
+    serverLog(LL_DEBUG, "key: %s is added to visiting_ssdb_keys, counter(w/r): %u/%u",
+              (char *)keysds, visiting_write_num, visiting_read_num);
+}
+
+void copyArgsFromWriteOp(client* c, struct ssdb_write_op* op) {
+    int j;
+    c->argc = op->argc;
+    c->cmd = op->cmd;
+    c->argv = zmalloc(sizeof(robj*) * op->argc);
+    for (j = 0; j < op->argc; j++) {
+        incrRefCount(op->argv[j]);
+        c->argv[j] = op->argv[j];
+    }
+}
+
+void saveSlaveSSDBwriteOp(client *c, time_t time, int index) {
+    int j;
+
+    struct ssdb_write_op * op = zmalloc(sizeof(struct ssdb_write_op));
+    op->time = time;
+    op->index = index;
+    op->cmd = c->cmd;
+    op->argc = c->argc;
+    op->argv = zmalloc(sizeof(robj*) * c->argc);
+
+    /* recored consumed memory size. */
+    for (j = 0; j < c->argc; j++) {
+        incrRefCount(c->argv[j]);
+        op->argv[j] = c->argv[j];
+
+        server.writeop_mem_size += sizeof(robj);
+        if (op->argv[j]->type == OBJ_STRING)
+            server.writeop_mem_size += SDS_MEM_SIZE((char*)(op->argv[j]->ptr));
+    }
+    listAddNodeTail(server.ssdb_write_oplist, op);
+
+    server.writeop_mem_size += sizeof(robj*) * op->argc + sizeof(struct ssdb_write_op) + sizeof(listNode);
+}
+
+void freeSSDBwriteOp(struct ssdb_write_op* op) {
+    int j;
+
+    // free argv
+    if (op->argv) {
+        /* op->argv may be set to NULL in runCommandReplicationConn */
+        for (j = 0; j < op->argc; j++) {
+            server.writeop_mem_size -= sizeof(robj);
+            if (op->argv[j]->type == OBJ_STRING)
+                server.writeop_mem_size -= SDS_MEM_SIZE((char*)(op->argv[j]->ptr));
+
+            decrRefCount(op->argv[j]);
+        }
+    }
+    if (op->argv) zfree(op->argv);
+
+    server.writeop_mem_size -= sizeof(robj*) * op->argc + sizeof(struct ssdb_write_op) + sizeof(listNode);
+
+    zfree(op);
+}
+
+void emptySlaveSSDBwriteOperations() {
+    listIter li;
+    listNode *ln;
+
+    dictEmpty(EVICTED_DATA_DB->visiting_ssdb_keys, NULL);
+    listRewind(server.ssdb_write_oplist, &li);
+    while((ln = listNext(&li))) {
+        listDelNode(server.ssdb_write_oplist, ln);
+    }
+    server.writeop_mem_size = 0;
+}
+
+void removeSuccessWriteop(time_t last_success_time, int last_success_index) {
+    struct ssdb_write_op* op;
+    listIter li;
+    listNode *ln;
+    listRewind(server.ssdb_write_oplist, &li);
+    while((ln = listNext(&li))) {
+        op = ln->value;
+        /* remove the successful write operations from buffer. */
+        if (last_success_time > op->time || (last_success_time == op->time && last_success_index > op->index)) {
+            listDelNode(server.ssdb_write_oplist, ln);
+        } else if (last_success_index == op->index && last_success_time == op->time && op->cmd->proc != flushallCommand) {
+            listDelNode(server.ssdb_write_oplist, ln);
+        }
+    }
+}
+
+int confirmAndRetrySlaveSSDBwriteOp(client* master, time_t time, int index) {
+    struct ssdb_write_op* op;
+    listIter li;
+    listNode *ln;
+    int impossible = 1;
+    int ret = C_OK;
+
+    if (time == -1 && index == -1)
+        serverLog(LL_DEBUG, "check and re-send all the rest write operations.");
+
+    listRewind(server.ssdb_write_oplist, &li);
+    while((ln = listNext(&li))) {
+        op = ln->value;
+        /* remove the successful write operations from buffer. */
+        if (time > op->time || (time == op->time && index > op->index)) {
+            serverAssert(impossible);
+            if (0 == server.slave_failed_retry_interrupted) {
+                listDelNode(server.ssdb_write_oplist, ln);
+            }
+        } else {
+            // for assert
+            impossible = 0;
+
+            if (time == op->time && index == op->index && 1 == server.slave_failed_retry_interrupted) {
+                server.slave_failed_retry_interrupted = 0;
+                server.blocked_write_op = NULL;
+            }
+
+            /* if last successful SSDB write command is 'flushall' but redis don't receive its response,
+             * we just redo it to empty redis. */
+            if (time == op->time && index == op->index && op->cmd->proc != flushallCommand) {
+                if (0 == server.slave_failed_retry_interrupted) {
+                    /* this write op was successful commited on SSDB, we can remove it from the list. */
+                    listDelNode(server.ssdb_write_oplist, ln);
+                    continue;
+                } else {
+                    /* we have found the write op saved by server.blocked_write_op, server.master is
+                     * unblocked now and we can go on. */
+                    ret = runCommandReplicationConn(master, ln);
+                    if (ret == C_BLOCKED) {
+                         /* server.master is blocked, return and handle it later. */
+                        server.slave_failed_retry_interrupted = 1;
+                        server.blocked_write_op = op;
+                        return ret;
+                    }
+                }
+            } else {
+
+                /* this is a failed write, retry it. */
+                if (op->cmd->proc == flushallCommand) {
+                    /* clean all keys need to transfer/load */
+                    dictEmpty(server.loadAndEvictCmdDict, NULL);
+
+                    ret = sendRepopidToSSDB(master, op->time, op->index, 1);
+                    if (ret != C_OK) break;
+
+                    master->cmd = server.flushallCommand;
+                    master->argc = 1;
+                    master->argv = zmalloc(sizeof(robj *) * 1);
+                    master->argv[0] = createObject(OBJ_STRING, sdsnew("flushall"));
+
+                    ret = blockAndFlushSlaveSSDB(master, op);
+                    /* server.master is blocked, return and handle the rest after unblock.*/
+                    if (ret == C_OK)
+                        return C_OK;
+                    else
+                        resetClient(master);
+                } else {
+                    /* Check if current cmd contains blocked keys. */
+                    if (op->argc > 1 && blockInMediateKey(master, op->cmd, op->argv, op->argc) == C_ERR) {
+                        /* server.master is blocked, return and handle it later. */
+                        server.slave_failed_retry_interrupted = 1;
+                        server.blocked_write_op = op;
+                        return C_ERR;
+                    }
+
+                    ret = runCommandReplicationConn(master, ln);
+                    if (ret == C_BLOCKED) {
+                         /* server.master is blocked, return and handle it later. */
+                        server.slave_failed_retry_interrupted = 1;
+                        server.blocked_write_op = op;
+                        return ret;
+                    }
+                }
+            }
+            /* we need reconnect SSDB for server.master, just break and will do these on
+            * the new SSDB connnection. */
+            if (ret != C_OK) break;
+
+        }
+    }
+    if (C_OK == ret)
+        master->ssdb_conn_flags |= CONN_SUCCESS;
+
+    if (C_OK == ret)
+        serverLog(LL_DEBUG, "server.master status is CONN_SUCCESS now");
+    else
+        serverLog(LL_DEBUG, "server.master status is NOT CONN_SUCCESS");
+
+    server.slave_failed_retry_interrupted = 0;
+    server.blocked_write_op = NULL;
+    return ret;
+}
+
+void updateSlaveSSDBwriteIndex() {
+     if (server.last_send_writeop_index == -1 && server.last_send_writeop_time == -1) {
+         server.last_send_writeop_time = server.unixtime;
+         server.last_send_writeop_index = 1;
+    } else {
+        serverAssert(server.last_send_writeop_index != -1 && server.last_send_writeop_time != -1);
+        if (server.unixtime == server.last_send_writeop_time) {
+            server.last_send_writeop_index++;
+        } else {
+            server.last_send_writeop_time = server.unixtime;
+            server.last_send_writeop_index = 1;
+        }
+    }
+}
+
+int updateSendRepopidToSSDB(client* c) {
+    int ret;
+
+    serverAssert(c->flags & CLIENT_MASTER);
+
+    updateSlaveSSDBwriteIndex();
+
+    /* for the replication connection of slave redis, we record write commands
+     * in server.ssdb_write_oplist, we just return and process next write command. */
+    saveSlaveSSDBwriteOp(c, server.last_send_writeop_time, server.last_send_writeop_index);
+
+    /* if ssdb connection flag of this client is not CONN_SUCCESS, just return. but for
+     * flushall command, we can do it also when the flag is before CONN_SUCCESS. */
+    if (c->cmd && (c->cmd->proc == flushallCommand || c->cmd->proc == flushdbCommand)) {
+        /* do nothing */
+    } else if (!(c->ssdb_conn_flags & CONN_SUCCESS))
+        return C_FD_ERR;
+
+    ret = sendRepopidToSSDB(c, server.last_send_writeop_time, server.last_send_writeop_index, 0);
+    if (ret == C_OK)
+        serverLog(LL_DEBUG, "repopid set %ld %d, server.master:%p, context:%p, context->fd:%d, ssdb conn flags:%d",
+                  server.last_send_writeop_time, server.last_send_writeop_index,
+                  (void*)server.master,
+                  (void*)server.master->context,
+                  server.master->context? server.master->context->fd : -1,
+                  server.master->ssdb_conn_flags);
+    return ret;
+}
+
+void recordVisitingSSDBkeys(struct redisCommand* cmd, robj** argv, int argc) {
+    int *keys = NULL, numkeys = 0, j;
+
+    keys = getKeysFromCommand(cmd, argv, argc, &numkeys);
+    for (j = 0; j < numkeys; j ++)
+        /* TODO: only support single key command. */
+        if (cmd->proc == migrateCommand)
+            addMigratingSSDBKey(argv[keys[j]]->ptr);
+        else
+            addVisitingSSDBKey(cmd, argv[keys[j]]->ptr);
+
+    if (keys) getKeysFreeResult(keys);
+}
+
+void updateExpireInfo(robj** argv, int argc, struct redisCommand* cmd) {
+    long long milliseconds = 0;
+    robj *tmpargv[3];
+
+    if (server.masterhost == NULL) return;
+
+    /* Update expire time in redis and update AOF. */
+    if ((milliseconds = getAbsoluteExpireTimeFromArgs(argv, argc, cmd)) != C_ERR) {
+        robj *key = argv[1];
+
+        /* setCommand or persist. */
+        if (milliseconds == C_NO_EXPIRE) {
+            serverAssert(cmd->proc == setCommand || cmd->proc == persistCommand);
+            if (removeExpire(EVICTED_DATA_DB, key)) {
+                /* Update aof. */
+                tmpargv[0] = createStringObject("PERSIST", 7);
+                tmpargv[1] = key;
+                propagate(server.persistCommand, EVICTED_DATA_DBID, tmpargv, 2, PROPAGATE_AOF);
+
+                decrRefCount(tmpargv[0]);
+            }
+        } else {
+            setExpire(NULL, EVICTED_DATA_DB, key, milliseconds);
+
+            /* Update aof. */
+            tmpargv[0] = createStringObject("PEXPIREAT", 9);
+            tmpargv[1] = key;
+            tmpargv[2] = createObject(OBJ_STRING, sdsfromlonglong(milliseconds));
+            propagate(server.pexpireatCommand, EVICTED_DATA_DBID, tmpargv, 3, PROPAGATE_AOF);
+
+            decrRefCount(tmpargv[0]);
+            decrRefCount(tmpargv[2]);
+        }
+    }
+
+    /* for slave redis, if this is a delCommand, we delete the key index directly to avoid
+     * some issues. when the del is caused by expire propagate or delete confirm propagate
+     * in our master, if we don't delete its key index in ssdb key dict, the following writes
+     * of a namesake key may get a wrong expire time. */
+    if (cmd->proc == delCommand) {
+        robj *key = argv[1];
+        serverAssert(server.lazyfree_lazy_expire ? dbAsyncDelete(EVICTED_DATA_DB, key) :
+                     dbSyncDelete(EVICTED_DATA_DB, key));
+        /* TODO: to support slave's slave. */
+        propagate(server.delCommand, EVICTED_DATA_DBID, argv, 2, PROPAGATE_AOF);
+    }
+}
+
+/* for the replication connection only, if returned value is C_ERR, this failed write
+ * command will be process in redis */
+int processCommandReplicationConn(client* c, struct ssdb_write_op* slave_retry_write) {
+    robj *keyobj = NULL;
+    struct redisCommand* cmd;
+    int argc;
+    robj** argv;
+
+    if (!(c->flags & CLIENT_MASTER))
+        return C_ERR;
+
+    if (slave_retry_write) {
+        cmd = slave_retry_write->cmd;
+        argc = slave_retry_write->argc;
+        argv = slave_retry_write->argv;
+    } else {
+        cmd = c->cmd;
+        argc = c->argc;
+        argv = c->argv;
+    }
+
+    if (!cmd || !(cmd->flags & CMD_WRITE))
+        return C_ERR;
+    if (cmd->flags & CMD_SWAPMODE_REDIS_ONLY)
+        return C_ERR;
+    if (argc <= 1)
+        return C_ERR;
+
+    keyobj = argv[1];
+    if (!dictFind(EVICTED_DATA_DB->dict, keyobj->ptr))
+        return C_ERR;
+
+    if (!(cmd->flags & CMD_SWAP_MODE))
+        return C_NOTSUPPORT_ERR;
+
+    /* prohibit write operations to SSDB when replication,
+     *
+     * Note: we also can have slaves if this server is a slave. */
+    if ((server.is_allow_ssdb_write == DISALLOW_SSDB_WRITE)
+        && (cmd->flags & CMD_WRITE) && (cmd->flags & CMD_SWAP_MODE)) {
+        listAddNodeTail(server.no_writing_ssdb_blocked_clients, c);
+        serverLog(LL_DEBUG, "server.master/server.cached_master is added to server.no_writing_ssdb_blocked_clients");
+        /* TODO: use a suitable timeout. */
+        c->bpop.timeout = 5000 + mstime();
+        blockClient(c, BLOCKED_NO_WRITE_TO_SSDB);
+
+        return C_BLOCKED;
+    }
+
+    /* Calling lookupKey to update lru or lfu counter. */
+    robj* val = lookupKey(EVICTED_DATA_DB, keyobj, LOOKUP_NONE);
+    if (val) {
+        int ret;
+        /* for slave, we update aof and expire info in redis at first. if this is a del
+         * command, we remove its key index from redis to avoid some consistency issues.*/
+        updateExpireInfo(argv, argc, cmd);
+
+        /* Sent the command to clients in MONITOR mode, only if the commands are
+         * not generated from reading an AOF. */
+        if (listLength(server.monitors) &&
+            !server.loading &&
+            !(c->cmd->flags & (CMD_SKIP_MONITOR|CMD_ADMIN))) {
+            replicationFeedMonitors(c,server.monitors,EVICTED_DATA_DBID,argv,argc);
+        }
+
+        if (slave_retry_write) {
+            sds finalcmd;
+            /* this is a failed write retry, reuse its write op time and id. */
+            ret = sendRepopidToSSDB(c, slave_retry_write->time, slave_retry_write->index, 1);
+            if (ret != C_OK) return ret;
+            finalcmd = composeCmdFromArgs(slave_retry_write->argc, slave_retry_write->argv);
+            ret = sendFailedRetryCommandToSSDB(c, finalcmd);
+        } else {
+            ret = updateSendRepopidToSSDB(c);
+            if (ret != C_OK) return ret;
+            ret = sendCommandToSSDB(c, NULL);
+        }
+
+        if (ret != C_OK) return ret;
+
+        /* Record the keys visting SSDB. */
+        recordVisitingSSDBkeys(cmd, argv, argc);
+
+        serverLog(LL_DEBUG, "processing %s, fd: %d in ssdb: %s",
+                  cmd->name, c->fd, argc > 1 ? (char *)argv[1]->ptr : "");
+
+        return C_OK;
+    }
+    return C_ERR;
+}
+
+/* Process keys may be in SSDB, only handle the command swap_mode supported.
+ The rest cases will be handled by processCommand. */
+int processCommandMaybeInSSDB(client *c) {
+    robj *keyobj = NULL;
+    int ret;
+
+    if ( !c->cmd || !(c->cmd->flags & (CMD_READONLY | CMD_WRITE)) )
+        return C_ERR;
+    if (c->cmd->flags & CMD_SWAPMODE_REDIS_ONLY)
+        return C_ERR;
+
+    if (c->argc <= 1)
+        return C_ERR;
+
+    /* TODO: support multiple key migrateCommand ??? */
+    if (c->cmd->proc == migrateCommand)
+        keyobj = c->argv[3];
+    else if (c->first_key_index != 0)
+        keyobj = c->argv[c->first_key_index];
+    else
+        keyobj = NULL;
+
+    if (!keyobj || !dictFind(EVICTED_DATA_DB->dict, keyobj->ptr))
+        return C_ERR;
+
+    /* prohibit write operations to SSDB when replication,
+     *
+     * Note: we also can have slaves if this server is a slave. */
+    if ((server.is_allow_ssdb_write == DISALLOW_SSDB_WRITE)
+        && (c->cmd->flags & CMD_WRITE) && (c->cmd->flags & CMD_SWAP_MODE)) {
+        listAddNodeTail(server.no_writing_ssdb_blocked_clients, c);
+        serverLog(LL_DEBUG, "client: %ld is added to server.no_writing_ssdb_blocked_clients", (long)c);
+        c->bpop.timeout = server.client_blocked_by_replication_nowrite_timeout + mstime();
+        blockClient(c, BLOCKED_NO_WRITE_TO_SSDB);
+
+        return C_OK;
+    }
+
+    /* prohibit read/write operations to SSDB when flushall */
+    if (server.masterhost == NULL && (server.prohibit_ssdb_read_write == PROHIBIT_SSDB_READ_WRITE)
+        && (c->cmd->flags & (CMD_WRITE | CMD_READONLY)) && (c->cmd->flags & CMD_SWAP_MODE)) {
+        listAddNodeTail(server.ssdb_flushall_blocked_clients, c);
+        c->bpop.timeout = server.client_blocked_by_flushall_timeout + mstime();
+        blockClient(c, BLOCKED_NO_READ_WRITE_TO_SSDB);
+
+        return C_OK;
+    }
+
+    if ((c->cmd->flags & (CMD_READONLY | CMD_WRITE)) &&
+         (c->cmd->flags & CMD_SWAP_MODE)) {
+        int lookup_flags = LOOKUP_NONE;
+        if (c->cmd->proc == typeCommand) lookup_flags = LOOKUP_NOTOUCH;
+
+        /* Calling lookupKey to update lru or lfu counter. */
+        robj* val = lookupKey(EVICTED_DATA_DB, keyobj, lookup_flags);
+        if (val) {
+            if (expireIfNeeded(EVICTED_DATA_DB, keyobj) == 1) {
+                ret = C_ERR;
+                goto check_blocked_clients;
+            }
+
+            if (c->cmd && c->cmd->proc == migrateCommand) {
+                char *argv[2];
+                sds dumpcmd;
+                size_t argvlen[2];
+
+                argv[0] = "dump";
+                argv[1] = keyobj->ptr;
+                argvlen[0] = 4;
+                argvlen[1] = sdslen(argv[1]);
+                dumpcmd = composeRedisCmd(2, (const char **)argv, argvlen);
+
+                if (!dumpcmd || sendCommandToSSDB(c, dumpcmd) != C_OK)
+                    addReplyError(c, "migrate dump error in ssdb.");
+
+                /* TODO: use a suitable timeout. */
+                c->bpop.timeout = server.client_blocked_by_migrate_dump_timeout + mstime();
+                blockClient(c, BLOCKED_MIGRATING_DUMP);
+                addMigratingSSDBKey(keyobj->ptr);
+
+                return C_OK;
+            }
+
+            /* Sent the command to clients in MONITOR mode, only if the commands are
+             * not generated from reading an AOF. */
+            if (listLength(server.monitors) &&
+                !server.loading &&
+                !(c->cmd->flags & (CMD_SKIP_MONITOR|CMD_ADMIN)))
+            {
+                replicationFeedMonitors(c,server.monitors,EVICTED_DATA_DBID,c->argv,c->argc);
+            }
+
+            ret = sendCommandToSSDB(c, NULL);
+            if (ret != C_OK)
+                goto check_blocked_clients;
+
+            server.stat_keyspace_ssdb_hits ++;
+
+            /* Record the keys visting SSDB. */
+            if (server.masterhost == NULL)
+                recordVisitingSSDBkeys(c->cmd, c->argv, c->argc);
+
+            c->bpop.timeout = server.client_visiting_ssdb_timeout + mstime();
+            blockClient(c, BLOCKED_VISITING_SSDB);
+
+            /* Slaves do not load data from ssdb automatically. */
+            if (server.masterhost) return C_OK;
+
+            if (c->cmd->proc == delCommand) return C_OK;
+
+            serverAssert(server.maxmemory_policy & MAXMEMORY_FLAG_LFU);
+            dictEntry* de = dictFind(EVICTED_DATA_DB->dict, keyobj->ptr);
+            sds db_key = dictGetKey(de);
+            unsigned int lfu = sdsgetlfu(db_key);
+            unsigned char counter = lfu & 255;
+            if ((counter > LFU_INIT_VAL) && !memoryReachLoadUpperLimit()) {
+                unsigned char idle = 255-counter;
+                replaceKeyInHotPool(keyobj->ptr, EVICTED_DATA_DBID, (unsigned long long)idle);
+            }
+            return C_OK;
+        }
+    }
+
+    return C_ERR;
+
+check_blocked_clients:
+    if (c->cmd->flags & CMD_WRITE)
+        unblockClientWritingOnSameKey(keyobj);
+    return ret;
+}
+
+void cleanAndSignalImmediateKeys(dict* dictory) {
+    dictEntry *de;
+    dictIterator *di;
+    sds key;
+    robj* o;
+
+    di = dictGetSafeIterator(dictory);
+    while((de = dictNext(di)) != NULL) {
+        key = dictGetKey(de);
+        o = createObject(OBJ_STRING, sdsdup(key));
+
+        signalBlockingKeyAsReady(&server.db[0], o);
+        decrRefCount(o);
+    }
+    dictReleaseIterator(di);
+    dictEmpty(dictory, NULL);
+
+    handleClientsBlockedOnSSDB();
+}
+
+void cleanAndSignalDeleteConfirmKeys() {
+    serverLog(LL_DEBUG, "clean and signal delete confirm keys");
+    cleanAndSignalImmediateKeys(server.db[EVICTED_DATA_DBID].delete_confirm_keys);
+}
+
+void cleanAndSignalHotKeys() {
+    serverLog(LL_DEBUG, "clean and signal hot keys to be load");
+    cleanAndSignalImmediateKeys(server.hot_keys);
+}
+
+void cleanAndSignalLoadingOrTransferringKeys() {
+    serverLog(LL_DEBUG, "clean and signal all loading/transferring/hot keys");
+    cleanAndSignalImmediateKeys(server.db[EVICTED_DATA_DBID].transferring_keys);
+    cleanAndSignalImmediateKeys(server.db[EVICTED_DATA_DBID].loading_hot_keys);
+    cleanAndSignalImmediateKeys(server.hot_keys);
+}
+
+void cleanSpecialClientsAndIntermediateKeys(int is_flushall) {
+    /* just free specail clients to discard unprocessed transferring/loading keys.*/
+    if (server.ssdb_client) freeClient(server.ssdb_client);
+    if (server.slave_ssdb_load_evict_client) freeClient(server.slave_ssdb_load_evict_client);
+    if (is_flushall && server.delete_confirm_client) freeClient(server.delete_confirm_client);
+
+    dictEmpty(EVICTED_DATA_DB->ssdb_keys_to_clean, NULL);
+    if (is_flushall) dictEmpty(server.maybe_deleted_ssdb_keys, NULL);
+    if (server.masterhost) dictEmpty(server.loadAndEvictCmdDict, NULL);
+
+    emptyEvictionPool();
+}
+
+/* for replication connection(server.master), after reconnect with SSDB success, we
+ * use this to retry failed/timeout write commands.*/
+int runCommandReplicationConn(client *c, listNode* writeop_ln) {
+    if (!(c->flags & CLIENT_MASTER)) return C_ERR;
+    struct ssdb_write_op* slave_retry_write = NULL;
+
+    if (writeop_ln)
+        slave_retry_write = writeop_ln->value;
+
+    int ret = processCommandReplicationConn(c, slave_retry_write);
+
+    if (ret != C_BLOCKED && !slave_retry_write) {
+        /* Update the applied replication offset of our master. */
+        c->reploff = c->read_reploff - sdslen(c->querybuf);
+    }
+    if (ret == C_OK) {
+        if (slave_retry_write)
+            serverLog(LL_DEBUG, "[REPOPID RE-SEND] re-send failed write op"
+                              "(key: %s, cmd:%s, op time:%ld, op id:%d) to SSDB",
+                      slave_retry_write->argc > 1 ? (sds)slave_retry_write->argv[1]->ptr : "",
+                      slave_retry_write->cmd->name, slave_retry_write->time, slave_retry_write->index);
+        /* for the replication connection of slave redis, after we send write commands
+         * to SSDB and record them in server.ssdb_write_oplist, we just return and
+         * process next write command. */
+        return C_OK;
+    } else if (ret == C_FD_ERR) {
+        /* for a slave failed write retry, we retrun error so don't go on to retry
+         * the rest failed writes. */
+        return ret;
+    } else if (ret == C_BLOCKED) {
+        return ret;
+    }
+    serverAssert(C_ERR == ret);
+
+    if (slave_retry_write) {
+        serverLog(LL_DEBUG, "[REPOPID RE-SEND] ignore failed write op"
+                          "(key: %s, cmd:%s, op time:%ld, op id:%d),"
+                          "caused by a delCommand after this write op",
+                  slave_retry_write->argc > 1 ? (sds)slave_retry_write->argv[1]->ptr : "",
+                  slave_retry_write->cmd->name, slave_retry_write->time, slave_retry_write->index);
+        /* for slave redis, when we receive delCommand from our master, we delete
+         * the key index directly to avoid some issues.(such as expire propagate
+         * or delete confirm propagate), so we need ignore all writes before del. */
+        listDelNode(server.ssdb_write_oplist, writeop_ln);
+        return C_OK;
+    }
+
+    call(c,CMD_CALL_FULL);
+    c->woff = server.master_repl_offset;
+
+    serverLog(LL_DEBUG, "processing %s, fd: %d in redis: %s, dbid: %d, argc: %d",
+              c->cmd->name, c->fd, c->argc > 1 ? (char *)c->argv[1]->ptr : "", c->db->id, c->argc);
+
+    return C_OK;
+}
+
+long long getAbsoluteExpireTimeFromArgs(robj** argv, int argc, struct redisCommand* cmd) {
+    robj *expireobj = NULL;
+    int num = sizeof(expiretimeInfoTable)/sizeof(struct expiretimeInfo);
+    int i;
+    long long milliseconds = 0;
+    struct expiretimeInfo ei;
+
+    if (!cmd) return C_ERR;
+
+    for (i = 0; i < num; i ++) {
+        ei = expiretimeInfoTable[i];
+        if (cmd->proc == ei.proc && argc > 0) {
+            expireobj = argv[ei.time_arg_index];
+
+            if (!expireobj || getLongLongFromObject(expireobj, &milliseconds) != C_OK)
+                return C_ERR;
+
+            if (ei.unit == UNIT_SECONDS) milliseconds *= 1000;
+            if (ei.base) milliseconds += mstime();
+            return milliseconds;
+        }
+    }
+
+    if (cmd->proc == setCommand) {
+        int i;
+        for (i = 3; i < argc; i ++) {
+            if (sdsEncodedObject(argv[i]) && !strcasecmp(argv[i]->ptr, "ex")) {
+                serverAssert(getLongLongFromObject(argv[i + 1], &milliseconds) == C_OK);
+                milliseconds *= 1000;
+                milliseconds += mstime();
+                return milliseconds;
+            }
+
+            if (sdsEncodedObject(argv[i]) && !strcasecmp(argv[i]->ptr, "px")) {
+                serverAssert(getLongLongFromObject(argv[i + 1], &milliseconds) == C_OK);
+                milliseconds += mstime();
+                return milliseconds;
+            }
+        }
+
+        return C_NO_EXPIRE;
+    }
+
+    if (cmd->proc == persistCommand)
+        return C_NO_EXPIRE;
+
+    return C_ERR;
+}
+
+int runCommand(client *c) {
+    int ret;
+    robj *firstkey = NULL;
+
+    if (((c->cmd->flags & CMD_READONLY || c->cmd->flags & CMD_WRITE)
+         && !(c->cmd->flags & CMD_SWAP_MODE) && !(c->cmd->flags & CMD_SWAPMODE_REDIS_ONLY)) ||
+        (c->cmd->flags & CMD_SWAPMODE_NOT_ALLOWED)) {
+        addReplyErrorFormat(c, "don't support this command in swap mode:%s.", c->cmd->name);
+        return C_OK;
+    }
+
+    if (c->flags & CLIENT_MASTER) {
+        ret = runCommandReplicationConn(c, NULL);
+        if (ret != C_BLOCKED) resetClient(c);
+        return ret;
+    }
+
+    /* Check the migrating keys. Don not move out from runCommand as async operations. */
+    if (server.swap_mode) {
+        if (c->cmd->firstkey != 0)
+            firstkey = c->argv[c->cmd->firstkey];
+        else if (c->cmd->proc == migrateCommand)
+            firstkey = c->argv[3];
+        else {
+            firstkey = c->argc > 1 ? c->argv[1] : NULL;
+            /* TODO: check all the cmds. */
+            serverLog(LL_DEBUG, "cmd->name: %s, c->argc: %d", c->cmd->name, c->argc);
+        }
+
+        /* TODO: block the client and delay the operations ??? */
+        if (firstkey && isMigratingSSDBKey(firstkey->ptr)) {
+            addReplyError(c, "key is migrating in ssdb");
+            return C_OK;
+        }
+    }
+
+    /* Exec the command */
+    if (server.swap_mode) {
+        ret = processCommandMaybeInSSDB(c);
+        if (ret == C_OK) {
+            /* Otherwise, return C_ERR to avoid calling resetClient,
+               the resetClient is delayed to ssdbClientUnixHandler. */
+            serverLog(LL_DEBUG, "processing %s, fd: %d in ssdb: %s",
+                      c->cmd->name, c->fd, firstkey ? (char *)firstkey->ptr : "");
+
+            if (!isSpecialConnection(c))
+                c->visit_ssdb_start = ustime();
+
+            return C_ERR;
+        } else if (ret == C_FD_ERR) {
+            addReplyErrorFormat(c, "SSDB disconnect");
+            return C_OK;
+        }
+    }
+
+    if (c->flags & CLIENT_MULTI &&
+        c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
+        c->cmd->proc != multiCommand && c->cmd->proc != watchCommand)
+    {
+        queueMultiCommand(c);
+        addReply(c,shared.queued);
+    } else {
+        call(c,CMD_CALL_FULL);
+        c->woff = server.master_repl_offset;
+    }
+
+    serverLog(LL_DEBUG, "processing %s, fd: %d in redis: %s, dbid: %d, argc: %d",
+              c->cmd->name, c->fd, firstkey ? (char *)firstkey->ptr : "", c->db->id, c->argc);
+
+    return C_OK;
+}
+
+void freeMultiCmd(multiCmd *md) {
+    zfree(md);
+}
+
+void handleCustomizedBlockedClients() {
+    if (listLength(server.ssdb_ready_keys))
+        handleClientsBlockedOnSSDB();
+    if ((server.is_allow_ssdb_write == ALLOW_SSDB_WRITE)
+        && listLength(server.no_writing_ssdb_blocked_clients))
+        handleClientsBlockedOnCustomizedPsync();
+    if ((server.prohibit_ssdb_read_write == NO_PROHIBIT_SSDB_READ_WRITE)
+        && listLength(server.ssdb_flushall_blocked_clients))
+        handleClientsBlockedOnFlushall();
+    if (listLength(server.delayed_migrate_clients))
+        handleClientsBlockedOnMigrate();
+}
+
+int tryBlockingClient(client *c) {
+    int ret;
+    robj *keyobj;
+
+    if (server.swap_mode
+        && c->cmd->proc == migrateCommand) {
+        ret = checkKeysForMigrate(c);
+        if (ret == C_NOTSUPPORT_ERR) return C_NOTSUPPORT_ERR;
+        if (ret == C_ERR) {
+            /* TODO: use a suitable timeout. */
+            c->bpop.timeout = server.client_blocked_by_migrate_timeout + mstime();
+            blockClient(c, BLOCKED_MIGRATING_CLIENT);
+            listAddNodeTail(server.delayed_migrate_clients, c);
+            serverLog(LL_DEBUG, "client migrate list add: %ld", (long)c);
+            return C_ERR;
+        }
+    }
+
+    /* Check if current cmd contains blocked keys. */
+    if (server.swap_mode && c->argc > 1 && checkKeysInMediateState(c) == C_ERR) {
+        /* Return C_ERR to keep client info and handle it later. */
+        return C_ERR;
+    }
+
+    if (server.masterhost == NULL
+        && (c->cmd->flags & CMD_WRITE)
+        && c->first_key_index
+        && (keyobj = c->argv[c->first_key_index])
+        && isThisKeyVisitingWriteSSDB(keyobj->ptr)) {
+        addClientToListForBlockedKey(c, c->cmd, server.db[0].blocking_keys_write_same_ssdbkey, keyobj);
+        c->bpop.timeout = server.client_visiting_ssdb_timeout + mstime();
+        serverLog(LL_DEBUG, "client fd:%d, cmd: %s, key: %s is blocked by another write on the same key",
+                  c->fd, c->cmd->name, (char*)keyobj->ptr);
+        blockClient(c, BLOCKED_WRITE_SAME_SSDB_KEY);
+        return C_ERR;
+    }
+
+    return C_OK;
+}
+
 /* If this function gets called we already read a whole
  * command, arguments are in the client argv/argc fields.
  * processCommand() execute the command or prepare the
@@ -2306,6 +4221,7 @@ void call(client *c, int flags) {
  * other operations can be performed by the caller. Otherwise
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
 int processCommand(client *c) {
+    int ret;
     /* The QUIT command is handled separately. Normal command procs will
      * go through checking for replication and QUIT will cause trouble
      * when FORCE_REPLICATION is enabled and would be implemented in
@@ -2349,7 +4265,8 @@ int processCommand(client *c) {
         !(c->flags & CLIENT_LUA &&
           server.lua_caller->flags & CLIENT_MASTER) &&
         !(c->cmd->getkeys_proc == NULL && c->cmd->firstkey == 0 &&
-          c->cmd->proc != execCommand))
+          c->cmd->proc != execCommand) &&
+        isSSDBrespCmd(c->cmd) != C_OK)
     {
         int hashslot;
         int error_code;
@@ -2380,6 +4297,10 @@ int processCommand(client *c) {
         /* It was impossible to free enough memory, and the command the client
          * is trying to execute is denied during OOM conditions? Error. */
         if ((c->cmd->flags & CMD_DENYOOM) && retval == C_ERR) {
+            if (server.swap_mode && c->cmd->proc == ssdbRespRestoreCommand) {
+                if (dictDelete(EVICTED_DATA_DB->loading_hot_keys, c->argv[1]->ptr) == DICT_OK)
+                    signalBlockingKeyAsReady(c->db, c->argv[1]);
+            }
             flagTransaction(c);
             addReply(c, shared.oomerr);
             return C_OK;
@@ -2420,11 +4341,14 @@ int processCommand(client *c) {
         return C_OK;
     }
 
+    /* for swap_mode, we don't allow write commands for connections if this
+     * is a slave, except for our master connection and SSDB respond commands. */
+
     /* Don't accept write commands if this is a read only slave. But
      * accept write commands if this is our master. */
-    if (server.masterhost && server.repl_slave_ro &&
-        !(c->flags & CLIENT_MASTER) &&
-        c->cmd->flags & CMD_WRITE)
+    if (server.masterhost && (server.swap_mode || server.repl_slave_ro) &&
+        !(c->flags & CLIENT_MASTER) && (c->cmd->flags & CMD_WRITE) &&
+        (!server.swap_mode || C_ERR == isSSDBrespCmd(c->cmd)))
     {
         addReply(c, shared.roslaveerr);
         return C_OK;
@@ -2475,20 +4399,58 @@ int processCommand(client *c) {
         return C_OK;
     }
 
-    /* Exec the command */
-    if (c->flags & CLIENT_MULTI &&
-        c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
-        c->cmd->proc != multiCommand && c->cmd->proc != watchCommand)
-    {
-        queueMultiCommand(c);
-        addReply(c,shared.queued);
-    } else {
-        call(c,CMD_CALL_FULL);
-        c->woff = server.master_repl_offset;
-        if (listLength(server.ready_keys))
-            handleClientsBlockedOnLists();
+    if (server.swap_mode
+        && server.masterhost
+        && (c->cmd->proc == storetossdbCommand
+            || c->cmd->proc == dumpfromssdbCommand)) {
+        dictEntry* entry = dictAddOrFind(server.loadAndEvictCmdDict, c->argv[1]->ptr);
+        if (c->cmd->proc == storetossdbCommand)
+            dictSetUnsignedIntegerVal(entry, TYPE_TRANSFER_TO_SSDB);
+        else if (c->cmd->proc == dumpfromssdbCommand)
+            dictSetUnsignedIntegerVal(entry, TYPE_LOAD_KEY_FORM_SSDB);
+
+        serverLog(LL_DEBUG, "load_or_store cmd: %s, key: %s is added to loadAndEvictCmdList.",
+                  c->cmd->name, (char *)c->argv[1]->ptr);
+        return C_OK;
     }
-    return C_OK;
+
+    if (server.swap_mode && (c->cmd->proc == flushallCommand || c->cmd->proc == flushdbCommand)) {
+        ret = processCommandMaybeFlushdb(c);
+        if (c->flags & CLIENT_MASTER) {
+            /* Update the applied replication offset of our master. */
+            c->reploff = c->read_reploff - sdslen(c->querybuf);
+
+            if (C_OK == ret) {
+                /* we are blocked by flushall, return C_ERR to keep client info and handle it later. */
+                return C_ERR;
+            } else {
+                /* when ssdb connection is disconnected, just save 'flushall' in server.ssdb_write_oplist
+                 * and go on. */
+                return C_OK;
+            }
+        } else {
+            if (C_OK == ret) {
+                /* Return C_ERR to keep client info and handle it later. */
+                return C_ERR;
+            } else if (C_ANOTHER_FLUSHALL_ERR == ret) {
+                addReplyError(c, "there is already another flushall task processing!");
+                return C_OK;
+            }
+        }
+    }
+
+    ret = tryBlockingClient(c);
+    if (ret == C_ERR) return C_ERR;
+    if (ret == C_NOTSUPPORT_ERR) return C_OK;
+
+    ret = runCommand(c);
+
+    if (listLength(server.ready_keys))
+        handleClientsBlockedOnLists();
+
+    if (server.swap_mode) handleCustomizedBlockedClients();
+
+    return ret;
 }
 
 /*================================== Shutdown =============================== */
@@ -2798,6 +4760,51 @@ void bytesToHuman(char *s, unsigned long long n) {
     }
 }
 
+sds printIntermediateSSDBkeys(sds info, dict* dictory) {
+    dictEntry *de;
+    dictIterator *di;
+    sds key;
+
+    serverAssert(dictory->type == &keyDictType);
+
+    di = dictGetSafeIterator(dictory);
+    while((de = dictNext(di)) != NULL) {
+        key = dictGetKey(de);
+        info = sdscatprintf(info, "%s\r\n", key);
+    }
+    dictReleaseIterator(di);
+    return info;
+}
+
+sds listAllIntermediateSSDBkeys(sds info) {
+    info = sdscatprintf(info, "\r\n# loading_hot_keys\r\n");
+    info = printIntermediateSSDBkeys(info, EVICTED_DATA_DB->loading_hot_keys);
+
+    info = sdscatprintf(info, "\r\n# transferring_keys\r\n");
+    info = printIntermediateSSDBkeys(info, EVICTED_DATA_DB->transferring_keys);
+
+    info = sdscatprintf(info, "\r\n# visiting_ssdb_keys\r\n");
+    info = printIntermediateSSDBkeys(info, EVICTED_DATA_DB->visiting_ssdb_keys);
+
+    info = sdscatprintf(info, "\r\n# delete_confirm_keys\r\n");
+    info = printIntermediateSSDBkeys(info, EVICTED_DATA_DB->delete_confirm_keys);
+
+    info = sdscatprintf(info, "\r\n# hot_keys_to_be_load\r\n");
+    info = printIntermediateSSDBkeys(info, server.hot_keys);
+
+    info = sdscatprintf(info, "\r\n# keys_may_be_deleted\r\n");
+    info = printIntermediateSSDBkeys(info, server.maybe_deleted_ssdb_keys);
+
+    return info;
+}
+
+void listLoadingKeysCommand(client* c) {
+    sds info = sdsempty();
+    info = listAllIntermediateSSDBkeys(info);
+
+    addReplyBulkSds(c, info);
+}
+
 /* Create the string returned by the INFO command. This is decoupled
  * by the INFO command itself as we need to report the same information
  * on memory corruption problems. */
@@ -3081,11 +5088,13 @@ sds genRedisInfoString(char *section) {
             "instantaneous_output_kbps:%.2f\r\n"
             "rejected_connections:%lld\r\n"
             "sync_full:%lld\r\n"
+            "sync_full_ok:%lld\r\n"
             "sync_partial_ok:%lld\r\n"
             "sync_partial_err:%lld\r\n"
             "expired_keys:%lld\r\n"
             "evicted_keys:%lld\r\n"
             "keyspace_hits:%lld\r\n"
+            "keyspace_hits_ssdb:%lld\r\n"
             "keyspace_misses:%lld\r\n"
             "pubsub_channels:%ld\r\n"
             "pubsub_patterns:%lu\r\n"
@@ -3105,11 +5114,13 @@ sds genRedisInfoString(char *section) {
             (float)getInstantaneousMetric(STATS_METRIC_NET_OUTPUT)/1024,
             server.stat_rejected_conn,
             server.stat_sync_full,
+            server.stat_sync_full_ok,
             server.stat_sync_partial_ok,
             server.stat_sync_partial_err,
             server.stat_expiredkeys,
             server.stat_evictedkeys,
             server.stat_keyspace_hits,
+            server.stat_keyspace_ssdb_hits,
             server.stat_keyspace_misses,
             dictSize(server.pubsub_channels),
             listLength(server.pubsub_patterns),
@@ -3143,6 +5154,7 @@ sds genRedisInfoString(char *section) {
                 "master_link_status:%s\r\n"
                 "master_last_io_seconds_ago:%d\r\n"
                 "master_sync_in_progress:%d\r\n"
+                "master_transfer_ssdb_snapshot_in_progress:%d\r\n"
                 "slave_repl_offset:%lld\r\n"
                 ,server.masterhost,
                 server.masterport,
@@ -3151,10 +5163,12 @@ sds genRedisInfoString(char *section) {
                 server.master ?
                 ((int)(server.unixtime-server.master->lastinteraction)) : -1,
                 server.repl_state == REPL_STATE_TRANSFER,
+                server.swap_mode && server.repl_state == REPL_STATE_TRANSFER_END,
                 slave_repl_offset
             );
 
-            if (server.repl_state == REPL_STATE_TRANSFER) {
+            if (server.repl_state == REPL_STATE_TRANSFER ||
+                (server.swap_mode && server.repl_state == REPL_STATE_TRANSFER_END)) {
                 info = sdscatprintf(info,
                     "master_sync_left_bytes:%lld\r\n"
                     "master_sync_last_io_seconds_ago:%d\r\n"
@@ -3214,6 +5228,9 @@ sds genRedisInfoString(char *section) {
                     break;
                 case SLAVE_STATE_SEND_BULK:
                     state = "send_bulk";
+                    break;
+                case SLAVE_STATE_SEND_BULK_FINISHED:
+                    state = "send_bulk_finished";
                     break;
                 case SLAVE_STATE_ONLINE:
                     state = "online";
@@ -3308,6 +5325,45 @@ sds genRedisInfoString(char *section) {
                     "db%d:keys=%lld,expires=%lld,avg_ttl=%lld\r\n",
                     j, keys, vkeys, server.db[j].avg_ttl);
             }
+        }
+    }
+
+    if (server.swap_mode && (allsections || defsections || !strcasecmp(section,"redis-ssdb"))) {
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info, "# Redis-SSDB\r\n"
+                                    "keys_in_redis_count:%lu\r\n"
+                                    "keys_in_ssdb_count:%lu\r\n"
+                                    "keys_loading_from_ssdb:%lu\r\n"
+                                    "keys_transferring_to_ssdb:%lu\r\n"
+                                    "keys_visiting_ssdb:%lu\r\n"
+                                    "keys_delete_confirming:%lu\r\n"
+                                    "keys_hot_to_be_load:%lu\r\n"
+                                    "keys_may_be_deleted:%lu\r\n",
+                            dictSize(server.db[0].dict),
+                            dictSize(EVICTED_DATA_DB->dict),
+                            dictSize(EVICTED_DATA_DB->loading_hot_keys),
+                            dictSize(EVICTED_DATA_DB->transferring_keys),
+                            dictSize(EVICTED_DATA_DB->visiting_ssdb_keys),
+                            dictSize(EVICTED_DATA_DB->delete_confirm_keys),
+                            dictSize(server.hot_keys),
+                            dictSize(server.maybe_deleted_ssdb_keys)
+        );
+
+        if (server.masterhost) {
+            info = sdscatprintf(info, "\r\nslave_unprocessed_transferring_or_loading_keys:%lu\r\n"
+                                        "slave_write_op_list_num:%lu\r\n"
+                                        "slave_write_op_list_memsize:%lld\r\n"
+                                        "slave_ssdb_critical_write_error_count:%d\r\n",
+                                dictSize(server.loadAndEvictCmdDict),
+                                listLength(server.ssdb_write_oplist),
+                                server.writeop_mem_size,
+                                server.slave_ssdb_critical_err_cnt
+            );
+        }
+
+        /* only print this in debug mode */
+        if (server.verbosity == LL_DEBUG) {
+            info = listAllIntermediateSSDBkeys(info);
         }
     }
     return info;
@@ -3532,7 +5588,9 @@ void loadDataFromDisk(void) {
                 (float)(ustime()-start)/1000000);
 
             /* Restore the replication ID / offset from the RDB file. */
-            if (server.masterhost &&
+            if (server.swap_mode) {
+                /* do nothing */
+            } else if (server.masterhost &&
                 rsi.repl_id_is_set &&
                 rsi.repl_offset != -1 &&
                 /* Note that older implementations may save a repl_stream_db
@@ -3817,6 +5875,7 @@ int main(int argc, char **argv) {
 
     if (argc == 1) {
         serverLog(LL_WARNING, "Warning: no config file specified, using the default config. In order to specify a config file use %s /path/to/%s.conf", argv[0], server.sentinel_mode ? "sentinel" : "redis");
+        if (server.swap_mode) server.dbnum += 1;
     } else {
         serverLog(LL_WARNING, "Configuration loaded");
     }

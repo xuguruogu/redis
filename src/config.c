@@ -44,13 +44,13 @@ typedef struct configEnum {
 } configEnum;
 
 configEnum maxmemory_policy_enum[] = {
-    {"volatile-lru", MAXMEMORY_VOLATILE_LRU},
+    /* {"volatile-lru", MAXMEMORY_VOLATILE_LRU}, */
     {"volatile-lfu", MAXMEMORY_VOLATILE_LFU},
-    {"volatile-random",MAXMEMORY_VOLATILE_RANDOM},
-    {"volatile-ttl",MAXMEMORY_VOLATILE_TTL},
-    {"allkeys-lru",MAXMEMORY_ALLKEYS_LRU},
+    /* {"volatile-random",MAXMEMORY_VOLATILE_RANDOM}, */
+    /* {"volatile-ttl",MAXMEMORY_VOLATILE_TTL}, */
+    /* {"allkeys-lru",MAXMEMORY_ALLKEYS_LRU}, */
     {"allkeys-lfu",MAXMEMORY_ALLKEYS_LFU},
-    {"allkeys-random",MAXMEMORY_ALLKEYS_RANDOM},
+    /* {"allkeys-random",MAXMEMORY_ALLKEYS_RANDOM}, */
     {"noeviction",MAXMEMORY_NO_EVICTION},
     {NULL, 0}
 };
@@ -214,7 +214,30 @@ void loadServerConfigFromString(char *config) {
             }
         } else if (!strcasecmp(argv[0],"protected-mode") && argc == 2) {
             if ((server.protected_mode = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"swap-mode") && argc == 2) {
+            if ((server.swap_mode = yesnotoi(argv[1])) == -1) {
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"load-from-ssdb") && argc == 2) {
+            if ((server.load_from_ssdb = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"use-customized-replication") && argc == 2) {
+            if ((server.use_customized_replication = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"ssdb-load-upper-limit") && argc == 2) {
+            server.ssdb_load_upper_limit = atoi(argv[1]);
+            if (server.ssdb_load_upper_limit > 100 ) {
+                err = "Invalid range, must be [0,100]"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"ssdb-transfer-lower-limit") && argc == 2) {
+            server.ssdb_transfer_lower_limit = atoi(argv[1]);
+            if (server.ssdb_transfer_lower_limit > 100 ) {
+                err = "Invalid range, must be [0,100]"; goto loaderr;
             }
         } else if (!strcasecmp(argv[0],"port") && argc == 2) {
             server.port = atoi(argv[1]);
@@ -237,6 +260,8 @@ void loadServerConfigFromString(char *config) {
             server.bindaddr_count = addresses;
         } else if (!strcasecmp(argv[0],"unixsocket") && argc == 2) {
             server.unixsocket = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0], "ssdb_server_unixsocket") && argc == 2) {
+            server.ssdb_server_unixsocket = zstrdup(argv[1]);
         } else if (!strcasecmp(argv[0],"unixsocketperm") && argc == 2) {
             errno = 0;
             server.unixsocketperm = (mode_t)strtol(argv[1], NULL, 8);
@@ -315,6 +340,8 @@ void loadServerConfigFromString(char *config) {
             }
         } else if (!strcasecmp(argv[0],"maxmemory") && argc == 2) {
             server.maxmemory = memtoll(argv[1],NULL);
+        } else if (!strcasecmp(argv[0],"datacenter-id") && argc == 2) {
+            server.datacenter_id = atoi(argv[1]);
         } else if (!strcasecmp(argv[0],"maxmemory-policy") && argc == 2) {
             server.maxmemory_policy =
                 configEnumGetValue(maxmemory_policy_enum,argv[1]);
@@ -351,15 +378,106 @@ void loadServerConfigFromString(char *config) {
                 err = "repl-ping-slave-period must be 1 or greater";
                 goto loaderr;
             }
+
+        } else if (!strcasecmp(argv[0],"client-visiting-ssdb-timeout") && argc == 2) {
+            server.client_visiting_ssdb_timeout = atoi(argv[1]);
+            if (server.client_visiting_ssdb_timeout <= 0) {
+                err = "client-visiting-ssdb-timeout must be 1 or greater";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"client-blocked-by-keys-timeout") && argc == 2) {
+            server.client_blocked_by_keys_timeout = atoi(argv[1]);
+            if (server.client_blocked_by_keys_timeout <= 0) {
+                err = "client-blocked-by-keys-timeout must be 1 or greater";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"client-blocked-by-flushall-timeout") && argc == 2) {
+            server.client_blocked_by_flushall_timeout = atoi(argv[1]);
+            if (server.client_blocked_by_flushall_timeout <= 0) {
+                err = "client-blocked-by-flushall-timeout must be 1 or greater";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"client-blocked-by-migrate-dump-timeout") && argc == 2) {
+            server.client_blocked_by_migrate_dump_timeout = atoi(argv[1]);
+            if (server.client_blocked_by_migrate_dump_timeout <= 0) {
+                err = "client-blocked-by-migrate-dump-timeout must be 1 or greater";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"client-blocked-by-replication-nowrite-timeout") && argc == 2) {
+            server.client_blocked_by_replication_nowrite_timeout = atoi(argv[1]);
+            if (server.client_blocked_by_replication_nowrite_timeout <= 0) {
+                err = "client-blocked-by-replication-nowrite-timeout must be 1 or greater";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"client-blocked-by-migrate-timeout") && argc == 2) {
+            server.client_blocked_by_migrate_timeout = atoi(argv[1]);
+            if (server.client_blocked_by_migrate_timeout <= 0) {
+                err = "client-blocked-by-migrate-timeout must be 1 or greater";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"slave-blocked-by-flushall-timeout") && argc == 2) {
+            server.slave_blocked_by_flushall_timeout = atoi(argv[1]);
+            if (server.slave_blocked_by_flushall_timeout <= 0) {
+                err = "slave-blocked-by-flushall-timeout must be 1 or greater";
+                goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"repl-timeout") && argc == 2) {
             server.repl_timeout = atoi(argv[1]);
             if (server.repl_timeout <= 0) {
                 err = "repl-timeout must be 1 or greater";
                 goto loaderr;
             }
+        } else if (!strcasecmp(argv[0],"slave-transfer-ssdb-snapshot-timeout") && argc == 2) {
+            server.slave_transfer_ssdb_snapshot_timeout = atoi(argv[1]);
+            if (server.slave_transfer_ssdb_snapshot_timeout <= 0) {
+                err = "slave-transfer-ssdb-snapshot-timeout must be 1 or greater";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"master-transfer-ssdb-snapshot-timeout") && argc == 2) {
+            server.master_transfer_ssdb_snapshot_timeout = atoi(argv[1]);
+            if (server.master_transfer_ssdb_snapshot_timeout <= 0) {
+                err = "master-transfer-ssdb-snapshot-timeout must be 1 or greater";
+                goto loaderr;
+            }
+         } else if (!strcasecmp(argv[0],"master-max-concurrent-loading-keys") && argc == 2) {
+            server.master_max_concurrent_loading_keys = atoi(argv[1]);
+            if (server.master_max_concurrent_loading_keys < 0) {
+                err = "master-max-concurrent-loading-keys must be 0 or greater";
+                goto loaderr;
+            }
+         } else if (!strcasecmp(argv[0],"master-max-concurrent-transferring-keys") && argc == 2) {
+            server.master_max_concurrent_transferring_keys = atoi(argv[1]);
+            if (server.master_max_concurrent_transferring_keys < 0) {
+                err = "master-max-concurrent-transferring-keys must be 0 or greater";
+                goto loaderr;
+            }
+         } else if (!strcasecmp(argv[0],"slave-max-concurrent-ssdb-swap-count") && argc == 2) {
+            server.slave_max_concurrent_ssdb_swap_count = atoi(argv[1]);
+            if (server.slave_max_concurrent_ssdb_swap_count < 0) {
+                err = "slave-max-concurrent-ssdb-swap-count must be 0 or greater";
+                goto loaderr;
+            }
+         } else if (!strcasecmp(argv[0],"slave-max-ssdb-swap-count-everytime") && argc == 2) {
+            server.slave_max_ssdb_swap_count_everytime = atoi(argv[1]);
+            if (server.slave_max_ssdb_swap_count_everytime < 0) {
+                err = "slave-max-ssdb-swap-count-everytime must be 0 or greater";
+                goto loaderr;
+            }
+         } else if (!strcasecmp(argv[0],"coldkey-filter-times-everytime") && argc == 2) {
+            server.coldkey_filter_times_everytime = atoi(argv[1]);
+            if (server.coldkey_filter_times_everytime < 0) {
+                err = "coldkey-filter-times-everytime must be 0 or greater";
+                goto loaderr;
+            }
+          } else if (!strcasecmp(argv[0],"lowest-idle-val-of-cold-key") && argc == 2) {
+            server.lowest_idle_val_of_cold_key = atoi(argv[1]);
+            if (server.lowest_idle_val_of_cold_key < 0 && server.lowest_idle_val_of_cold_key > 255) {
+                err = "lowest-idle-val-of-cold-key must be a integer between [0-255]";
+                goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"repl-disable-tcp-nodelay") && argc==2) {
             if ((server.repl_disable_tcp_nodelay = yesnotoi(argv[1])) == -1) {
-                err = "argument must be 'yes' or 'no'"; goto loaderr;
+                err = "repl-disable-tcp-nodelay argument must be 'yes' or 'no'"; goto loaderr;
             }
         } else if (!strcasecmp(argv[0],"repl-diskless-sync") && argc==2) {
             if ((server.repl_diskless_sync = yesnotoi(argv[1])) == -1) {
@@ -732,6 +850,17 @@ void loadServerConfigFromString(char *config) {
         sdsfreesplitres(argv,argc);
     }
 
+    if (server.swap_mode) {
+        server.dbnum += 1;
+
+        if (server.ssdb_load_upper_limit > 0 &&
+                server.ssdb_transfer_lower_limit >= server.ssdb_load_upper_limit) {
+            err = "ssdb transfer/load will not work, ssdb-load-upper-limit"
+                    " must be greater than ssdb-transfer-lower-limit ";
+            goto loaderr;
+        }
+    }
+
     /* Sanity checks. */
     if (server.cluster_enabled && server.masterhost) {
         linenum = slaveof_linenum;
@@ -857,6 +986,7 @@ void configSetCommand(client *c) {
 
         /* Try to check if the OS is capable of supporting so many FDs. */
         server.maxclients = ll;
+
         if (ll > orig_value) {
             adjustOpenFilesLimit();
             if (server.maxclients != ll) {
@@ -923,7 +1053,7 @@ void configSetCommand(client *c) {
             appendServerSaveParams(seconds, changes);
         }
         sdsfreesplitres(v,vlen);
-    } config_set_special_field("dir") {
+     } config_set_special_field("dir") {
         if (chdir((char*)o->ptr) == -1) {
             addReplyErrorFormat(c,"Changing directory: %s", strerror(errno));
             return;
@@ -1020,6 +1150,10 @@ void configSetCommand(client *c) {
     } config_set_bool_field(
       "protected-mode",server.protected_mode) {
     } config_set_bool_field(
+      "load-from-ssdb",server.load_from_ssdb) {
+    } config_set_bool_field(
+        "use-customized-replication",server.use_customized_replication) {
+    } config_set_bool_field(
       "stop-writes-on-bgsave-error",server.stop_writes_on_bgsave_err) {
     } config_set_bool_field(
       "lazyfree-lazy-eviction",server.lazyfree_lazy_eviction) {
@@ -1031,13 +1165,29 @@ void configSetCommand(client *c) {
       "slave-lazy-flush",server.repl_slave_lazy_flush) {
     } config_set_bool_field(
       "no-appendfsync-on-rewrite",server.aof_no_fsync_on_rewrite) {
-
     /* Numerical fields.
      * config_set_numerical_field(name,var,min,max) */
+    } config_set_numerical_field(
+      "ssdb-transfer-lower-limit",server.ssdb_transfer_lower_limit,0,100) {
+    } config_set_numerical_field(
+      "ssdb-load-upper-limit",server.ssdb_load_upper_limit,0,100) {
     } config_set_numerical_field(
       "tcp-keepalive",server.tcpkeepalive,0,LLONG_MAX) {
     } config_set_numerical_field(
       "maxmemory-samples",server.maxmemory_samples,1,LLONG_MAX) {
+    } config_set_numerical_field(
+      "datacenter-id",server.datacenter_id,0,UCHAR_MAX) {
+      if (server.cluster_enabled) {
+        if (server.cluster && server.cluster->myself) {
+          if (server.cluster->myself->datacenter_id != server.datacenter_id) {
+            serverLog(LL_NOTICE, "my datacenter-id changed from %u to %u",
+            (unsigned int)server.cluster->myself->datacenter_id, (unsigned int)server.datacenter_id);
+            server.cluster->myself->datacenter_id = server.datacenter_id;
+            /* we will broadcast our config to the other nodes in clusterCron function. */
+            server.cluster->myself->flags |= CLUSTER_NODE_DATACENTER_CHANGED;
+          }
+        }
+      }
     } config_set_numerical_field(
       "lfu-log-factor",server.lfu_log_factor,0,LLONG_MAX) {
     } config_set_numerical_field(
@@ -1079,13 +1229,43 @@ void configSetCommand(client *c) {
     } config_set_numerical_field(
       "slowlog-max-len",ll,0,LLONG_MAX) {
       /* Cast to unsigned. */
-        server.slowlog_max_len = (unsigned)ll;
+      server.slowlog_max_len = (unsigned)ll;
     } config_set_numerical_field(
       "latency-monitor-threshold",server.latency_monitor_threshold,0,LLONG_MAX){
     } config_set_numerical_field(
       "repl-ping-slave-period",server.repl_ping_slave_period,1,LLONG_MAX) {
     } config_set_numerical_field(
       "repl-timeout",server.repl_timeout,1,LLONG_MAX) {
+    } config_set_numerical_field(
+      "master-transfer-ssdb-snapshot-timeout",server.master_transfer_ssdb_snapshot_timeout,1,LLONG_MAX) {
+    } config_set_numerical_field(
+      "slave-transfer-ssdb-snapshot-timeout",server.slave_transfer_ssdb_snapshot_timeout,1,LLONG_MAX) {
+    } config_set_numerical_field(
+      "master-max-concurrent-loading-keys",server.master_max_concurrent_loading_keys,0,LLONG_MAX) {
+    } config_set_numerical_field(
+      "master-max-concurrent-transferring-keys",server.master_max_concurrent_transferring_keys,0,LLONG_MAX) {
+    } config_set_numerical_field(
+      "slave-max-concurrent-ssdb-swap-count",server.slave_max_concurrent_ssdb_swap_count,0,LLONG_MAX) {
+    } config_set_numerical_field(
+      "slave-max-ssdb-swap-count-everytime",server.slave_max_ssdb_swap_count_everytime,0,LLONG_MAX) {
+    } config_set_numerical_field(
+      "coldkey-filter-times-everytime",server.coldkey_filter_times_everytime,0,LLONG_MAX) {
+    } config_set_numerical_field(
+      "lowest-idle-val-of-cold-key",server.lowest_idle_val_of_cold_key,0,255) {
+    } config_set_numerical_field(
+      "client-visiting-ssdb-timeout",server.client_visiting_ssdb_timeout,1,LLONG_MAX) {
+    } config_set_numerical_field(
+      "client-blocked-by-keys-timeout",server.client_blocked_by_keys_timeout,1,LLONG_MAX) {
+    } config_set_numerical_field(
+      "client-blocked-by-flushall-timeout",server.client_blocked_by_flushall_timeout,1,LLONG_MAX) {
+    } config_set_numerical_field(
+      "client-blocked-by-replication-nowrite-timeout",server.client_blocked_by_replication_nowrite_timeout,1,LLONG_MAX) {
+    } config_set_numerical_field(
+      "client-blocked-by-migrate-dump-timeout",server.client_blocked_by_migrate_dump_timeout,1,LLONG_MAX) {
+    } config_set_numerical_field(
+      "client-blocked-by-migrate-timeout",server.client_blocked_by_migrate_timeout,1,LLONG_MAX) {
+    } config_set_numerical_field(
+      "slave-blocked-by-flushall-timeout",server.slave_blocked_by_flushall_timeout,1,LLONG_MAX) {
     } config_set_numerical_field(
       "repl-backlog-ttl",server.repl_backlog_time_limit,0,LLONG_MAX) {
     } config_set_numerical_field(
@@ -1214,6 +1394,7 @@ void configGetCommand(client *c) {
     config_get_string_field("masterauth",server.masterauth);
     config_get_string_field("cluster-announce-ip",server.cluster_announce_ip);
     config_get_string_field("unixsocket",server.unixsocket);
+    config_get_string_field("ssdb_server_unixsocket",server.ssdb_server_unixsocket);
     config_get_string_field("logfile",server.logfile);
     config_get_string_field("pidfile",server.pidfile);
     config_get_string_field("slave-announce-ip",server.slave_announce_ip);
@@ -1261,6 +1442,23 @@ void configGetCommand(client *c) {
     config_get_numerical_field("databases",server.dbnum);
     config_get_numerical_field("repl-ping-slave-period",server.repl_ping_slave_period);
     config_get_numerical_field("repl-timeout",server.repl_timeout);
+
+    config_get_numerical_field("master-transfer-ssdb-snapshot-timeout", server.master_transfer_ssdb_snapshot_timeout);
+    config_get_numerical_field("slave-transfer-ssdb-snapshot-timeout", server.slave_transfer_ssdb_snapshot_timeout);
+    config_get_numerical_field("master-max-concurrent-loading-keys", server.master_max_concurrent_loading_keys);
+    config_get_numerical_field("master-max-concurrent-transferring-keys", server.master_max_concurrent_transferring_keys);
+    config_get_numerical_field("slave-max-concurrent-ssdb-swap-count", server.slave_max_concurrent_ssdb_swap_count);
+    config_get_numerical_field("slave-max-ssdb-swap-count-everytime", server.slave_max_ssdb_swap_count_everytime);
+    config_get_numerical_field("coldkey-filter-times-everytime", server.coldkey_filter_times_everytime);
+    config_get_numerical_field("lowest-idle-val-of-cold-key", server.lowest_idle_val_of_cold_key);
+
+    config_get_numerical_field("client-visiting-ssdb-timeout",server.client_visiting_ssdb_timeout);
+    config_get_numerical_field("client-blocked-by-keys-timeout",server.client_blocked_by_keys_timeout);
+    config_get_numerical_field("client-blocked-by-flushall-timeout",server.client_blocked_by_flushall_timeout);
+    config_get_numerical_field("client-blocked-by-replication-nowrite-timeout",server.client_blocked_by_replication_nowrite_timeout);
+    config_get_numerical_field("client-blocked-by-migrate-dump-timeout",server.client_blocked_by_migrate_dump_timeout);
+    config_get_numerical_field("client-blocked-by-migrate-timeout",server.client_blocked_by_migrate_timeout);
+    config_get_numerical_field("slave-blocked-by-flushall-timeout",server.slave_blocked_by_flushall_timeout);
     config_get_numerical_field("repl-backlog-size",server.repl_backlog_size);
     config_get_numerical_field("repl-backlog-ttl",server.repl_backlog_time_limit);
     config_get_numerical_field("maxclients",server.maxclients);
@@ -1275,6 +1473,11 @@ void configGetCommand(client *c) {
     config_get_numerical_field("cluster-slave-validity-factor",server.cluster_slave_validity_factor);
     config_get_numerical_field("repl-diskless-sync-delay",server.repl_diskless_sync_delay);
     config_get_numerical_field("tcp-keepalive",server.tcpkeepalive);
+    config_get_numerical_field("ssdb-transfer-lower-limit",server.ssdb_transfer_lower_limit);
+    config_get_numerical_field("ssdb-load-upper-limit",server.ssdb_load_upper_limit);
+    config_get_numerical_field("lfu-log-factor",server.lfu_log_factor);
+    config_get_numerical_field("lfu-decay-time",server.lfu_decay_time);
+    config_get_numerical_field("datacenter-id",server.datacenter_id);
 
     /* Bool (yes/no) values */
     config_get_bool_field("cluster-require-full-coverage",
@@ -1293,6 +1496,9 @@ void configGetCommand(client *c) {
     config_get_bool_field("activerehashing", server.activerehashing);
     config_get_bool_field("activedefrag", server.active_defrag_enabled);
     config_get_bool_field("protected-mode", server.protected_mode);
+    config_get_bool_field("swap-mode", server.swap_mode);
+    config_get_bool_field("load-from-ssdb", server.load_from_ssdb);
+    config_get_bool_field("use-customized-replication", server.use_customized_replication);
     config_get_bool_field("repl-disable-tcp-nodelay",
             server.repl_disable_tcp_nodelay);
     config_get_bool_field("repl-diskless-sync",
@@ -1955,6 +2161,7 @@ int rewriteConfig(char *path) {
     rewriteConfigNumericalOption(state,"tcp-backlog",server.tcp_backlog,CONFIG_DEFAULT_TCP_BACKLOG);
     rewriteConfigBindOption(state);
     rewriteConfigStringOption(state,"unixsocket",server.unixsocket,NULL);
+    rewriteConfigStringOption(state,"ssdb_server_unixsocket",server.ssdb_server_unixsocket,NULL);
     rewriteConfigOctalOption(state,"unixsocketperm",server.unixsocketperm,CONFIG_DEFAULT_UNIX_SOCKET_PERM);
     rewriteConfigNumericalOption(state,"timeout",server.maxidletime,CONFIG_DEFAULT_CLIENT_TIMEOUT);
     rewriteConfigNumericalOption(state,"tcp-keepalive",server.tcpkeepalive,CONFIG_DEFAULT_TCP_KEEPALIVE);
@@ -1965,7 +2172,7 @@ int rewriteConfig(char *path) {
     rewriteConfigStringOption(state,"syslog-ident",server.syslog_ident,CONFIG_DEFAULT_SYSLOG_IDENT);
     rewriteConfigSyslogfacilityOption(state);
     rewriteConfigSaveOption(state);
-    rewriteConfigNumericalOption(state,"databases",server.dbnum,CONFIG_DEFAULT_DBNUM);
+    rewriteConfigNumericalOption(state,"databases", (server.swap_mode ? server.dbnum - 1 : server.dbnum),CONFIG_DEFAULT_DBNUM);
     rewriteConfigYesNoOption(state,"stop-writes-on-bgsave-error",server.stop_writes_on_bgsave_err,CONFIG_DEFAULT_STOP_WRITES_ON_BGSAVE_ERROR);
     rewriteConfigYesNoOption(state,"rdbcompression",server.rdb_compression,CONFIG_DEFAULT_RDB_COMPRESSION);
     rewriteConfigYesNoOption(state,"rdbchecksum",server.rdb_checksum,CONFIG_DEFAULT_RDB_CHECKSUM);
@@ -1979,6 +2186,23 @@ int rewriteConfig(char *path) {
     rewriteConfigYesNoOption(state,"slave-read-only",server.repl_slave_ro,CONFIG_DEFAULT_SLAVE_READ_ONLY);
     rewriteConfigNumericalOption(state,"repl-ping-slave-period",server.repl_ping_slave_period,CONFIG_DEFAULT_REPL_PING_SLAVE_PERIOD);
     rewriteConfigNumericalOption(state,"repl-timeout",server.repl_timeout,CONFIG_DEFAULT_REPL_TIMEOUT);
+
+    rewriteConfigNumericalOption(state,"master-transfer-ssdb-snapshot-timeout",server.master_transfer_ssdb_snapshot_timeout,MASTER_TRANSFER_SSDB_SNAPSHOT_TIMEOUT);
+    rewriteConfigNumericalOption(state,"slave-transfer-ssdb-snapshot-timeout",server.slave_transfer_ssdb_snapshot_timeout,SLAVE_SSDB_TRANSFER_SNAPSHOT_TIMEOUT);
+    rewriteConfigNumericalOption(state,"master-max-concurrent-loading-keys",server.master_max_concurrent_loading_keys,MASTER_MAX_CONCURRENT_LOADING_KEYS);
+    rewriteConfigNumericalOption(state,"master-max-concurrent-transferring-keys",server.master_max_concurrent_transferring_keys,MASTER_MAX_CONCURRENT_TRANSFERRING_KEYS);
+    rewriteConfigNumericalOption(state,"slave-max-concurrent-ssdb-swap-count",server.slave_max_concurrent_ssdb_swap_count,SLAVE_MAX_CONCURRENT_SSDB_SWAP_COUNT);
+    rewriteConfigNumericalOption(state,"slave-max-ssdb-swap-count-everytime",server.slave_max_ssdb_swap_count_everytime,SLAVE_MAX_SSDB_SWAP_COUNT_EVERYTIME);
+    rewriteConfigNumericalOption(state,"coldkey-filter-times-everytime",server.coldkey_filter_times_everytime,COLDKEY_FILTER_TIMES_EVERYTIME);
+    rewriteConfigNumericalOption(state,"lowest-idle-val-of-cold-key",server.lowest_idle_val_of_cold_key,LOWEST_IDLE_VAL_OF_COLD_KEY);
+
+    rewriteConfigNumericalOption(state,"client-visiting-ssdb-timeout",server.client_visiting_ssdb_timeout,CONFIG_DEFAULT_CLIENT_VISITING_SSDB_TIMEOUT);
+    rewriteConfigNumericalOption(state,"client-blocked-by-keys-timeout",server.client_blocked_by_keys_timeout,CONFIG_DEFAULT_CLIENT_BLOCKED_BY_KEYS_TIMEOUT);
+    rewriteConfigNumericalOption(state,"client-blocked-by-flushall-timeout",server.client_blocked_by_flushall_timeout,CONFIG_DEFAULT_CLIENT_BLOCKED_BY_FLUSHALL_TIMEOUT);
+    rewriteConfigNumericalOption(state,"client-blocked-by-replication-nowrite-timeout",server.client_blocked_by_replication_nowrite_timeout,CONFIG_DEFAULT_CLIENT_BLOCKED_BY_REPLICATION_NOWRITE_TIMEOUT);
+    rewriteConfigNumericalOption(state,"client-blocked-by-migrate-dump-timeout",server.client_blocked_by_migrate_dump_timeout,CONFIG_DEFAULT_CLIENT_BLOCKED_BY_MIGRATE_DUMP_TIMEOUT);
+    rewriteConfigNumericalOption(state,"client-blocked-by-migrate-timeout",server.client_blocked_by_migrate_timeout,CONFIG_DEFAULT_CLIENT_BLOCKED_BY_MIGRATE_TIMEOUT);
+    rewriteConfigNumericalOption(state,"slave-blocked-by-flushall-timeout",server.slave_blocked_by_flushall_timeout,CONFIG_DEFAULT_SLAVE_BLOCKED_BY_FLUSHALL_TIMEOUT);
     rewriteConfigBytesOption(state,"repl-backlog-size",server.repl_backlog_size,CONFIG_DEFAULT_REPL_BACKLOG_SIZE);
     rewriteConfigBytesOption(state,"repl-backlog-ttl",server.repl_backlog_time_limit,CONFIG_DEFAULT_REPL_BACKLOG_TIME_LIMIT);
     rewriteConfigYesNoOption(state,"repl-disable-tcp-nodelay",server.repl_disable_tcp_nodelay,CONFIG_DEFAULT_REPL_DISABLE_TCP_NODELAY);
@@ -2025,6 +2249,9 @@ int rewriteConfig(char *path) {
     rewriteConfigYesNoOption(state,"activerehashing",server.activerehashing,CONFIG_DEFAULT_ACTIVE_REHASHING);
     rewriteConfigYesNoOption(state,"activedefrag",server.active_defrag_enabled,CONFIG_DEFAULT_ACTIVE_DEFRAG);
     rewriteConfigYesNoOption(state,"protected-mode",server.protected_mode,CONFIG_DEFAULT_PROTECTED_MODE);
+    rewriteConfigYesNoOption(state,"swap-mode",server.swap_mode,CONFIG_DEFAULT_SWAP_MODE);
+    rewriteConfigYesNoOption(state,"load-from-ssdb",server.load_from_ssdb,CONFIG_DEFAULT_LOAD_FROM_SSDB);
+    rewriteConfigYesNoOption(state,"use-customized-replication",server.use_customized_replication,CONFIG_DEFAULT_USE_CUSTOMIZED_REPLICATION);
     rewriteConfigClientoutputbufferlimitOption(state);
     rewriteConfigNumericalOption(state,"hz",server.hz,CONFIG_DEFAULT_HZ);
     rewriteConfigYesNoOption(state,"aof-rewrite-incremental-fsync",server.aof_rewrite_incremental_fsync,CONFIG_DEFAULT_AOF_REWRITE_INCREMENTAL_FSYNC);
@@ -2035,6 +2262,9 @@ int rewriteConfig(char *path) {
     rewriteConfigYesNoOption(state,"lazyfree-lazy-expire",server.lazyfree_lazy_expire,CONFIG_DEFAULT_LAZYFREE_LAZY_EXPIRE);
     rewriteConfigYesNoOption(state,"lazyfree-lazy-server-del",server.lazyfree_lazy_server_del,CONFIG_DEFAULT_LAZYFREE_LAZY_SERVER_DEL);
     rewriteConfigYesNoOption(state,"slave-lazy-flush",server.repl_slave_lazy_flush,CONFIG_DEFAULT_SLAVE_LAZY_FLUSH);
+    rewriteConfigNumericalOption(state,"ssdb-transfer-lower-limit",server.ssdb_transfer_lower_limit,CONFIG_DEFAULT_SSDB_TRANSFER_LOWER_LIMIT);
+    rewriteConfigNumericalOption(state,"ssdb-load-upper-limit",server.ssdb_load_upper_limit,CONFIG_DEFAULT_SSDB_LOAD_UPPER_LIMIT);
+    rewriteConfigNumericalOption(state,"datacenter-id",server.datacenter_id,0);
 
     /* Rewrite Sentinel config if in Sentinel mode. */
     if (server.sentinel_mode) rewriteConfigSentinelOption(state);
